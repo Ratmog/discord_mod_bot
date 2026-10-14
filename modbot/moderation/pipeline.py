@@ -26,6 +26,17 @@ AUTHOR_DM = (
 )
 REPORT_FORM = "https://dis.gd/request"
 
+MAX_EDIT_RETRIES = 2  # re-judge an edited message at most this many times before giving up
+
+
+class _LockEntry:
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.refs = 0
+
+
 COLORS = {"deleted": 0xD83C3E, "would": 0xE8A33D, "flag": 0x5B8DEF, "error": 0x888888}
 
 
@@ -75,7 +86,7 @@ class Pipeline:
         self.guild_id = guild_id
         self.flags = flags or SettingsFlags(db)
         self._inflight: dict[tuple, asyncio.Future] = {}
-        self._locks: dict[int, asyncio.Lock] = {}
+        self._locks: dict[int, _LockEntry] = {}
 
     # ---- public -------------------------------------------------------------
 
@@ -138,9 +149,7 @@ class Pipeline:
 
     # ---- decide, act, record ------------------------------------------------
 
-    async def _finish(
-        self, inp: ModerationInput, result: ModerationResult | None, trigger: Trigger, retried: bool = False
-    ) -> Outcome:
+    async def _finish(self, inp: ModerationInput, result: ModerationResult | None, trigger: Trigger) -> Outcome:
         rules = self.rules
         report_count = 0
         if trigger is Trigger.REPORT:
@@ -156,51 +165,67 @@ class Pipeline:
             case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
             return await self._report(inp, verdict, trigger, case_id, False, False, report_count)
 
-        # Enforced delete. One action per message at a time: concurrent reports and
-        # the auto path queue here, and later ones see the message already gone.
-        lock = self._locks.setdefault(inp.message_id, asyncio.Lock())
+        # Enforced delete: one action per message at a time. The entry is
+        # reference-counted and only evicted when nobody holds or awaits it;
+        # Lock.locked() is False between a release and the next waiter waking.
+        entry = self._locks.get(inp.message_id)
+        if entry is None:
+            entry = self._locks[inp.message_id] = _LockEntry()
+        entry.refs += 1
         try:
-            async with lock:
-                return await self._enforce(inp, result, verdict, trigger, report_count, retried)
+            async with entry.lock:
+                return await self._enforce(inp, result, verdict, trigger, report_count)
         finally:
-            if not lock.locked() and self._locks.get(inp.message_id) is lock:
+            entry.refs -= 1
+            if entry.refs == 0 and self._locks.get(inp.message_id) is entry:
                 del self._locks[inp.message_id]
 
+    async def _record(self, inp, result, verdict, trigger, report_count, deleted=False, gone=False) -> Outcome:
+        case_id = await self.db.append_case(inp, result, verdict, trigger.value, self.rules.version, report_count)
+        return await self._report(inp, verdict, trigger, case_id, deleted, gone, report_count)
+
     async def _enforce(
-        self, inp: ModerationInput, result: ModerationResult, verdict: Verdict, trigger: Trigger,
-        report_count: int, retried: bool,
+        self, inp: ModerationInput, result: ModerationResult, verdict: Verdict, trigger: Trigger, report_count: int,
     ) -> Outcome:
-        rules = self.rules
-        if await self.db.already_deleted(inp.message_id):
-            verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already removed by ModBot")
-            case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
-            return Outcome(verdict, case_id, gone=True)  # no second post, DM, or Discord call
+        """Runs under the message's lock. Never calls back into _finish (the lock isn't reentrant)."""
+        for attempt in range(MAX_EDIT_RETRIES + 1):
+            if await self.db.already_deleted(inp.message_id):
+                verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already removed")
+                case_id = await self.db.append_case(inp, result, verdict, trigger.value, self.rules.version,
+                                                    report_count)
+                return Outcome(verdict, case_id, gone=True)  # no second post, DM, or Discord call
 
-        try:
-            current = await self.gw.fetch_message(inp.channel_id, inp.message_id)
-        except GoneError:
-            verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already gone")
-            case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
-            return await self._report(inp, verdict, trigger, case_id, False, True, report_count)
-        except TransientError:
-            verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
-                              reason=verdict.reason + "; re-fetch failed, kept")
-            case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
-            return await self._report(inp, verdict, trigger, case_id, False, False, report_count)
+            try:
+                current = await self.gw.fetch_message(inp.channel_id, inp.message_id)
+            except GoneError:
+                verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already gone")
+                return await self._record(inp, result, verdict, trigger, report_count, gone=True)
+            except TransientError:
+                verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
+                                  reason=verdict.reason + "; re-fetch failed, kept")
+                return await self._record(inp, result, verdict, trigger, report_count)
 
-        if content_hash(current.content) != inp.hash:
-            if not retried:  # edited since scoring: judge the new text once
-                new_inp = replace(inp, content=current.content)
-                new_res = (await self._scores([new_inp]))[0]
-                return await self._finish(new_inp, new_res, trigger, retried=True)
-            verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
-                              reason=verdict.reason + "; message keeps changing, kept")
-            case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
-            return await self._report(inp, verdict, trigger, case_id, False, False, report_count)
+            if content_hash(current.content) == inp.hash:
+                break
+            if attempt == MAX_EDIT_RETRIES:
+                verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
+                                  reason=verdict.reason + "; message keeps changing, kept")
+                return await self._record(inp, result, verdict, trigger, report_count)
+
+            # Edited since scoring: judge the current text, still under this lock.
+            inp = replace(inp, content=current.content)
+            new_result = (await self._scores([inp]))[0]
+            if new_result is None:
+                return await self._record(inp, None, Verdict.error("classifier unavailable; kept"),
+                                          trigger, report_count)
+            result = new_result
+            verdict = evaluate(self.rules, result, self.flags, trigger)
+            if not (verdict.decision is Decision.DELETE and verdict.enforced):
+                return await self._record(inp, result, verdict, trigger, report_count)
 
         # Write the audit record BEFORE deleting, so a crash in between leaves a
         # pending action that reconcile() resolves on restart.
-        case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count,
+        case_id = await self.db.append_case(inp, result, verdict, trigger.value, self.rules.version, report_count,
                                             action="pending")
         deleted = gone = False
         try:
@@ -218,13 +243,17 @@ class Pipeline:
         return await self._report(inp, verdict, trigger, case_id, deleted, gone, report_count)
 
     async def reconcile(self) -> int:
-        """Resolve deletions left 'pending' by a crash. Returns how many were fixed."""
+        """Resolve deletions left 'pending' by a crash. Returns how many were resolved.
+
+        A missing message only proves the message is gone, not that ModBot deleted
+        it (a moderator may have), so it's recorded as gone_unconfirmed, not done.
+        """
         fixed = 0
         for case_id, channel_id, message_id in await self.db.pending_actions():
             try:
                 await self.gw.fetch_message(channel_id, message_id)
             except GoneError:
-                await self.db.finish_action(case_id, "done")  # the delete went through
+                await self.db.finish_action(case_id, "gone_unconfirmed")
             except TransientError:
                 continue  # try again next start
             else:

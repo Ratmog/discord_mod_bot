@@ -23,7 +23,6 @@ CREATE TABLE IF NOT EXISTS cleanup_queue (
     last_error   TEXT,
     updated_at   INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_cleanup_due ON cleanup_queue(status, created_at);
 
 CREATE TABLE IF NOT EXISTS scores_cache (
     message_id     INTEGER NOT NULL,
@@ -55,13 +54,9 @@ CREATE TABLE IF NOT EXISTS cases (
     reason         TEXT,
     enforced       INTEGER NOT NULL,     -- 0 = would-have-acted
     mod_outcome    TEXT,                 -- optional: violation | fine
-    action         TEXT,                 -- enforced delete: pending | done | gone | failed
+    action         TEXT,                 -- enforced delete: pending | done | gone | gone_unconfirmed | failed
     created_at     INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_cases_action ON cases(action) WHERE action = 'pending';
-CREATE INDEX IF NOT EXISTS idx_cases_msg ON cases(message_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_cases_calib ON cases(rule_id, decision, enforced);
-CREATE INDEX IF NOT EXISTS idx_cases_author ON cases(author_id, rule_id, created_at);
 
 CREATE TABLE IF NOT EXISTS report_cooldowns (
     reporter_hash TEXT PRIMARY KEY,
@@ -74,6 +69,22 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+"""
+
+
+# Columns added after a table first shipped. CREATE TABLE IF NOT EXISTS never
+# alters an existing table, so each one is added explicitly on connect.
+MIGRATIONS: list[tuple[str, str, str]] = [
+    ("cases", "action", "TEXT"),
+]
+
+# Indexes run after migrations, since they may reference migrated columns.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_cleanup_due ON cleanup_queue(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_cases_msg ON cases(message_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cases_calib ON cases(rule_id, decision, enforced);
+CREATE INDEX IF NOT EXISTS idx_cases_author ON cases(author_id, rule_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cases_action ON cases(action) WHERE action = 'pending';
 """
 
 
@@ -96,9 +107,19 @@ class Database:
         self._conn = await aiosqlite.connect(self.path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA)
+        await self._migrate()
+        await self._conn.executescript(INDEXES)
         await self._conn.commit()
         async with self._conn.execute("SELECT key, value FROM settings") as cur:
             self._settings = {r["key"]: r["value"] async for r in cur}
+
+    async def _migrate(self) -> None:
+        for table, column, decl in MIGRATIONS:
+            async with self.conn.execute(f"PRAGMA table_info({table})") as cur:
+                cols = {r["name"] async for r in cur}
+            if column not in cols:
+                await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        await self.conn.commit()
 
     async def close(self) -> None:
         if self._conn:
@@ -247,8 +268,9 @@ class Database:
 
     async def finish_action(self, case_id: int, action: str, verdict: Verdict | None = None) -> None:
         """Resolve a pending enforced delete. done = deleted; anything else = not enforced."""
-        if action == "done":
-            await self.conn.execute("UPDATE cases SET action = 'done' WHERE case_id = ?", (case_id,))
+        if action in ("done", "gone_unconfirmed"):
+            # gone_unconfirmed: recovery found the message missing but can't prove ModBot deleted it
+            await self.conn.execute("UPDATE cases SET action = ? WHERE case_id = ?", (action, case_id))
         elif verdict is not None:
             await self.conn.execute(
                 "UPDATE cases SET action = ?, enforced = 0, decision = ?, reason = ? WHERE case_id = ?",
@@ -269,7 +291,7 @@ class Database:
 
     async def already_deleted(self, message_id: int) -> bool:
         async with self.conn.execute(
-            "SELECT 1 FROM cases WHERE message_id = ? AND action = 'done' LIMIT 1", (message_id,)
+            "SELECT 1 FROM cases WHERE message_id = ? AND action IN ('done', 'gone_unconfirmed') LIMIT 1", (message_id,)
         ) as cur:
             return await cur.fetchone() is not None
 
@@ -281,7 +303,7 @@ class Database:
     async def flagged_deletions(self, author_id: int, rule_id: str, since: int) -> int:
         async with self.conn.execute(
             "SELECT COUNT(*) AS n FROM cases WHERE author_id = ? AND rule_id = ? AND decision = 'DELETE' "
-            "AND enforced = 1 AND created_at >= ?",
+            "AND enforced = 1 AND action = 'done' AND created_at >= ?",
             (author_id, rule_id, since),
         ) as cur:
             return (await cur.fetchone())["n"]

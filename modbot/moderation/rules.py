@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -107,28 +107,51 @@ class RuleSet:
         return {c for r in self.rules for c in r.categories}
 
 
+_RANK = {Decision.DELETE: 2, Decision.ESCALATE: 1}
+
+
+def _evaluate_rule(rule: Rule, result: ModerationResult, flags: Flags, key: str) -> Verdict | None:
+    """One rule's verdict, or None if it doesn't match at all."""
+    cat, score = max(((c, result.scores.get(c, 0.0)) for c in rule.categories), key=lambda t: t[1])
+    live = flags.enforce(rule.id) and (not flags.dry_run or rule.ignores_dry_run)
+
+    def verdict(decision: Decision, reason: str, enforced: bool, ping: bool) -> Verdict:
+        return Verdict(decision, rule.id, reason, enforced, ping, True, rule.redact)
+
+    if rule.delete_if_flagged and result.flagged.get(cat, False):
+        return verdict(Decision.DELETE, f"{cat} flagged by classifier ({score:.2f})", live, rule.ping)
+    cutoff = rule.delete_at.get(key)
+    suppressed = not rule.ignores_context and any(
+        result.context.get(label, 0.0) >= t for label, t in rule.suppress_if.items()
+    )
+    if cutoff is not None and score >= cutoff and not suppressed:
+        return verdict(Decision.DELETE, f"{cat}={score:.2f} >= {key} cutoff {cutoff}", live, rule.ping)
+    if rule.log_at is not None and score >= rule.log_at:
+        return verdict(Decision.ESCALATE, f"{cat}={score:.2f} (log tier)", False, False)
+    if rule.escalate_at is not None and score >= rule.escalate_at:
+        reason = f"{cat}={score:.2f}" + (" (context suppressed deletion)" if suppressed else "")
+        return verdict(Decision.ESCALATE, reason, False, False)
+    return None
+
+
 def evaluate(rules: RuleSet, result: ModerationResult, flags: Flags, trigger: Trigger) -> Verdict:
-    """Pure and cheap: re-run for every trigger against current rules and flags."""
+    """Pure and cheap: re-run for every trigger against current rules and flags.
+
+    Every rule is evaluated; the most severe outcome wins (live delete, then
+    would-delete, then flag), with rule order breaking ties. A weak signal from
+    an early rule can't mask a strong one from a later rule. Redaction is sticky:
+    if any matching rule redacts, the final verdict does too.
+    """
     key = trigger.threshold_key
-    for rule in rules.rules:
-        cat, score = max(((c, result.scores.get(c, 0.0)) for c in rule.categories), key=lambda t: t[1])
-        live = flags.enforce(rule.id) and (not flags.dry_run or rule.ignores_dry_run)
-
-        def verdict(decision: Decision, reason: str, enforced: bool, ping: bool, rule=rule) -> Verdict:
-            return Verdict(decision, rule.id, reason, enforced, ping, True, rule.redact)
-
-        if rule.delete_if_flagged and result.flagged.get(cat, False):
-            return verdict(Decision.DELETE, f"{cat} flagged by classifier ({score:.2f})", live, rule.ping)
-
-        cutoff = rule.delete_at.get(key)
-        suppressed = not rule.ignores_context and any(
-            result.context.get(label, 0.0) >= t for label, t in rule.suppress_if.items()
-        )
-        if cutoff is not None and score >= cutoff and not suppressed:
-            return verdict(Decision.DELETE, f"{cat}={score:.2f} >= {key} cutoff {cutoff}", live, rule.ping)
-        if rule.log_at is not None and score >= rule.log_at:
-            return verdict(Decision.ESCALATE, f"{cat}={score:.2f} (log tier)", False, False)
-        if rule.escalate_at is not None and score >= rule.escalate_at:
-            reason = f"{cat}={score:.2f}" + (" (context suppressed deletion)" if suppressed else "")
-            return verdict(Decision.ESCALATE, reason, False, False)
-    return Verdict.keep()
+    matches = [(i, v) for i, rule in enumerate(rules.rules)
+               if (v := _evaluate_rule(rule, result, flags, key)) is not None]
+    if not matches:
+        return Verdict.keep()
+    _, best = max(matches, key=lambda iv: (iv[1].decision is Decision.DELETE and iv[1].enforced,
+                                           _RANK.get(iv[1].decision, 0), -iv[0]))
+    others = [v for _, v in matches if v is not best]
+    redact = best.redact or any(v.redact for v in others)
+    reason = best.reason
+    if others:
+        reason += "; also " + ", ".join(f"{v.rule_id} ({v.reason})" for v in others)
+    return replace(best, redact=redact, reason=reason)
