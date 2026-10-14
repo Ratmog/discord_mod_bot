@@ -6,7 +6,9 @@ a fresh IDENTIFY (a RESUME replays missed events, so it needs nothing).
 
 The catch-up checkpoint is `gateway_down_since`, written when the gateway
 disconnects, not the sweeper heartbeat: the sweeper can keep running while the
-gateway is down, so its heartbeat says nothing about what was observed.
+gateway is down, so its heartbeat says nothing about what was observed. It's
+cleared only after a scan in which every channel succeeded; a partial scan keeps
+(or records) it and the next sweep retries.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ class Cleanup(commands.Cog):
     def __init__(self, bot: ModBot):
         self.bot = bot
         self._seen_ready = False
+        self._catchup_due = False  # a previous catch-up didn't finish every channel
         self._last_warn = 0
         self._no_perm_logged: set[int] = set()
 
@@ -99,41 +102,55 @@ class Cleanup(commands.Cog):
             return
         await self.catch_up()
 
-    def _catchup_since(self, down: str | None) -> int:
-        db = self.bot.db
+    def _catchup_start(self, down: str | None) -> int:
+        """Earliest time whose messages may not have been seen (bounded to CATCHUP_WINDOW)."""
         candidates = [int(down)] if down else []
-        hb = db.last_heartbeat()
+        hb = self.bot.db.last_heartbeat()
         if hb:
-            candidates.append(hb)  # process restart: we saw nothing after the last sweep
-        start = min(candidates) if candidates else 0
-        return max(start, now() - CATCHUP_WINDOW) - 60
+            candidates.append(hb)  # process restart: nothing was seen after the last sweep
+        start = min(candidates) if candidates else now() - CATCHUP_WINDOW
+        return max(start, now() - CATCHUP_WINDOW)
 
-    async def catch_up(self) -> None:
-        """Game messages the bot never saw: bounded window, paginated to the end (INSERT OR IGNORE)."""
-        down = self.bot.db.setting("gateway_down_since")
-        since = self._catchup_since(down)
-        after = dt.datetime.fromtimestamp(since, dt.UTC)
-        found = 0
+    async def catch_up(self) -> bool:
+        """Queue game messages the bot never saw. Paginates each channel to the end;
+        enqueueing is idempotent. Returns True only if every channel was scanned."""
+        db = self.bot.db
+        down = db.setting("gateway_down_since")
+        start = self._catchup_start(down)
+        after = dt.datetime.fromtimestamp(start - 60, dt.UTC)  # 60 s overlap; duplicates are ignored
+        found, failed = 0, []
         for ch in self._channels():
             try:
                 async for m in ch.history(after=after, limit=None, oldest_first=True):
                     if self._should_clean(m):
-                        await self.bot.db.enqueue_cleanup(m.id, ch.id, snowflake_ts(m.id))
+                        await db.enqueue_cleanup(m.id, ch.id, snowflake_ts(m.id))
                         found += 1
             except discord.HTTPException:
+                failed.append(ch.id)
                 log.warning("catch-up failed for channel %s", ch.id, exc_info=True)
+        if failed:
+            # Keep the window open: make sure a checkpoint covers it (it survives a
+            # restart) and retry on the next sweep.
+            if not down:
+                await db.set_setting("gateway_down_since", str(start))
+            self._catchup_due = True
+            log.warning("catch-up incomplete (%d channel(s) failed, %d queued); retrying next sweep",
+                        len(failed), found)
+            return False
         # Clear the checkpoint only if no new disconnect was recorded during the scan.
-        if self.bot.db.setting("gateway_down_since") == down:
-            await self.bot.db.set_setting("gateway_down_since", "")
+        if db.setting("gateway_down_since") == down:
+            await db.set_setting("gateway_down_since", "")
+        self._catchup_due = False
         log.info("cleanup catch-up queued %d message(s)", found)
+        return True
 
     @tasks.loop(seconds=60)
     async def sweeper(self) -> None:
         # Errors are caught here rather than in a loop error handler: an uncaught
         # exception stops a tasks.loop, and cleanup must keep running.
         try:
-            if self.sweeper.current_loop == 0:
-                await self.catch_up()  # first iteration only; on_ready repeats on IDENTIFY
+            if self.sweeper.current_loop == 0 or self._catchup_due:
+                await self.catch_up()  # first iteration, or retrying a partial scan
             report = await sweep(self.bot.db, self.bot.gateway)
             if report.deleted or report.gone or report.retried:
                 log.info("sweep: deleted=%d gone=%d retried=%d", report.deleted, report.gone, report.retried)

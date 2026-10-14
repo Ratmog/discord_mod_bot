@@ -30,7 +30,7 @@ Only the expensive classifier call is cached; decisions are recomputed for every
 4. **Configure:**
    ```bash
    python3.11 -m venv venv && . venv/bin/activate
-   pip install -r requirements.txt
+   pip install -r requirements.txt   # needs discord.py 2.5+
    cp .env.example .env   # then fill it in
    ```
    Get IDs with Discord's Developer Mode (Settings → Advanced), then right-click → Copy ID. Copy the game bots' user IDs from your own server.
@@ -52,9 +52,10 @@ Each `#mod-logs` post has **Violation / Fine** buttons. Marking cases is optiona
 ## Reliability guarantees
 
 - **One action per message.** Concurrent reports of the same message cause exactly one Discord delete.
-- **Audit before action.** An enforced delete is recorded as `pending` before Discord is called. On restart, a message that's still up is re-judged and removed if it still breaks a rule; one that's gone is recorded as `gone_unconfirmed`, since ModBot can't prove it was the one that deleted it.
+- **Audit before action.** An enforced delete is recorded as `pending` before Discord is called. A recovery pass runs at startup and every 2 minutes: a message that's still up is re-judged and removed if it still breaks a rule; one that's gone is recorded as `gone_unconfirmed`, since ModBot can't prove it was the one that deleted it. If the re-check itself can't run (OpenAI down and the text was edited meanwhile), the original alert is kept and posted so a moderator looks at it. Recovery never touches a delete that's still in flight, and a resolved case is never overwritten.
 - **Mod-log posts can't be lost.** Each post is queued with its case and retried every minute until Discord accepts it, so a crash or outage can't silently drop a child-safety alert. (A crash at exactly the wrong moment can repeat a post; it can't drop one.)
-- **Outages are retried.** Messages that arrive while OpenAI is down are re-scored up to 3 times with growing delays.
+- **Outages are retried.** Messages that arrive while OpenAI is down are re-scored up to 3 times with growing delays. These retries live in memory, so a restart during an outage drops them.
+- **Missed game messages.** After a restart or reconnect, recent channel history is scanned for game-bot messages the bot never saw. If any channel fails, the scan's starting point is kept and the scan retries next minute.
 
 ## Rollout
 

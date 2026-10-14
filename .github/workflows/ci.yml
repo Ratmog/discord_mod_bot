@@ -3,11 +3,21 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest versions requirements.txt allows: API drift shows up here first.
+          - python: "3.11"
+            discord: "discord.py==2.5.0"
+          - python: "3.13"
+            discord: "discord.py"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: pip install -r requirements-dev.txt
+          python-version: ${{ matrix.python }}
+      - run: pip install "${{ matrix.discord }}" -r requirements-dev.txt
+      - run: python -c "import discord; print('discord.py', discord.__version__)"
       - run: ruff check .
       - run: pytest -q

@@ -7,10 +7,12 @@ Invariants:
 - At most one enforcement action per message at a time (reference-counted lock),
   and nothing called while holding that lock re-enters it.
 - An enforced delete is recorded as `pending` before Discord is called, so a
-  crash leaves something `reconcile()` can resolve.
+  crash leaves something `reconcile()` can resolve. reconcile() runs
+  periodically and skips deletes in flight in this process; a resolved row is
+  never overwritten (finish_action only touches pending rows).
 - Mod-log posts go through an outbox (`cases.notify`): written as pending with
   the case, marked sent once Discord accepts the post, retried by
-  `flush_notifications()` otherwise. At-least-once: a crash between a post and
+  `flush_notifications()` (Recovery cog) otherwise. At-least-once: a crash between a post and
   its "sent" mark can repeat a post, which beats losing a child-safety alert.
 """
 
@@ -112,6 +114,7 @@ class Pipeline:
         self.flags = flags or SettingsFlags(db)
         self._inflight: dict[tuple, asyncio.Future] = {}
         self._locks: dict[int, _LockEntry] = {}
+        self._acting: set[int] = set()  # message ids with a delete in flight in this process
 
     # ---- public -------------------------------------------------------------
 
@@ -249,22 +252,29 @@ class Pipeline:
                 return await self._record(inp, result, verdict, trigger)
 
         # Write the audit record BEFORE deleting, so a crash in between leaves a
-        # pending action that reconcile() resolves on restart.
-        case_id = await self.db.append_case(inp, result, verdict, trigger.value, self.rules.version, action="pending")
-        deleted = gone = False
+        # pending action that reconcile() resolves. Mark the message as in flight
+        # before the first await, so a concurrent reconcile() pass can't mistake
+        # this live delete for a crash leftover.
+        self._acting.add(inp.message_id)
         try:
-            await self.gw.delete_message(inp.channel_id, inp.message_id)
-        except GoneError:
-            gone = True
-            verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already gone")
-            await self.db.finish_action(case_id, "gone", verdict)
-        except TransientError:
-            verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
-                              reason=verdict.reason + "; delete failed, kept")
-            await self.db.finish_action(case_id, "failed", verdict)
-        else:
-            deleted = True
-            await self.db.finish_action(case_id, "done")
+            case_id = await self.db.append_case(inp, result, verdict, trigger.value, self.rules.version,
+                                                action="pending")
+            deleted = gone = False
+            try:
+                await self.gw.delete_message(inp.channel_id, inp.message_id)
+            except GoneError:
+                gone = True
+                verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already gone")
+                await self.db.finish_action(case_id, "gone", verdict)
+            except TransientError:
+                verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
+                                  reason=verdict.reason + "; delete failed, kept")
+                await self.db.finish_action(case_id, "failed", verdict)
+            else:
+                deleted = True
+                await self.db.finish_action(case_id, "done")
+        finally:
+            self._acting.discard(inp.message_id)
         if verdict.post:
             await self._notify(case_id)  # pings still fire when the delete failed: that's when they matter most
         if deleted:
@@ -272,26 +282,44 @@ class Pipeline:
         return Outcome(verdict, case_id, deleted=deleted, gone=gone)
 
     async def reconcile(self) -> int:
-        """Resolve deletions left 'pending' by a crash. Returns how many were resolved.
+        """Resolve enforced deletes left 'pending' by a crash. Returns how many were resolved.
+
+        Safe to run periodically: deletes in flight in this process are skipped, and
+        finish_action never overwrites a row that's no longer pending.
 
         Missing message: it's gone, but that doesn't prove ModBot deleted it (a
-        moderator may have), so it's gone_unconfirmed. Still present: the crash
-        hit before Discord got the DELETE, so the violation may still be up;
-        re-check it with current rules rather than leaving it.
+        moderator may have), so it's gone_unconfirmed and its alert still posts.
+        Still present: the crash hit before Discord got the DELETE, so the violation
+        may still be up. It's re-judged as a new case under current rules. Only if
+        that re-check actually scores is the old case superseded; if it can't (the
+        classifier is down and the text changed since), the old case keeps its
+        alert, so a moderator is still told.
         """
         resolved = 0
         for row in await self.db.pending_actions():
+            if row["message_id"] in self._acting:
+                continue  # a live delete in this process, not a crash leftover
             try:
                 current = await self.gw.fetch_message(row["channel_id"], row["message_id"])
             except GoneError:
                 await self.db.finish_action(row["case_id"], "gone_unconfirmed")
+                resolved += 1
+                continue
             except TransientError:
-                continue  # try again next start
-            else:
+                continue  # unresolved; the next periodic pass retries
+            if row["message_id"] in self._acting:
+                continue  # a live delete started while we were fetching
+
+            trigger = Trigger.AUTO if row["trigger"] == Trigger.AUTO.value else Trigger.RECHECK
+            inp = ModerationInput(current.message_id, current.channel_id, current.author_id, current.content)
+            outcome = await self.run(inp, trigger)
+            if outcome.scored:
                 await self.db.finish_action(row["case_id"], "superseded")
-                trigger = Trigger.AUTO if row["trigger"] == Trigger.AUTO.value else Trigger.RECHECK
-                inp = ModerationInput(current.message_id, current.channel_id, current.author_id, current.content)
-                await self.run(inp, trigger)
+            else:
+                kept = Verdict(Decision.ERROR, row["rule_id"],
+                               (row["reason"] or "") + "; restarted before delete, re-check failed, kept",
+                               enforced=False, ping=bool(row["ping"]), post=True)
+                await self.db.finish_action(row["case_id"], "failed", kept)  # its pending alert still posts
             resolved += 1
         return resolved
 

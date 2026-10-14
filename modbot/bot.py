@@ -18,7 +18,7 @@ from modbot.views import OutcomeButton
 
 log = logging.getLogger("modbot")
 
-COGS = ("modbot.cogs.reports", "modbot.cogs.auto", "modbot.cogs.cleanup", "modbot.cogs.outbox",
+COGS = ("modbot.cogs.reports", "modbot.cogs.auto", "modbot.cogs.cleanup", "modbot.cogs.recovery",
         "modbot.cogs.admin")
 REQUIRED_PERMS = ("view_channel", "read_message_history", "send_messages", "embed_links", "manage_messages")
 
@@ -57,10 +57,7 @@ class ModBot(commands.Bot):
         log.info("logged in as %s (%s)", self.user, getattr(self.user, "id", "?"))
         if self._checked_perms:
             return
-        self._checked_perms = True
-        fixed = await self.pipeline.reconcile()  # deletions a crash left half-recorded
-        if fixed:
-            log.info("reconciled %d pending deletion(s)", fixed)
+        self._checked_perms = True  # crash recovery runs in the Recovery cog's loop
         guild = self.get_guild(self.config.guild_id)
         if guild is None:
             log.error("bot is not in guild %s", self.config.guild_id)

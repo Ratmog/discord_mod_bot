@@ -285,35 +285,43 @@ class Database:
         ) as cur:
             return await cur.fetchone() is not None
 
-    async def finish_action(self, case_id: int, action: str, verdict: Verdict | None = None) -> None:
-        """Resolve a pending enforced delete.
+    async def finish_action(self, case_id: int, action: str, verdict: Verdict | None = None) -> bool:
+        """Resolve a pending enforced delete. Returns False if the row was no longer
+        pending (already resolved elsewhere); a resolved row is never overwritten.
 
         done              ModBot's DELETE succeeded.
         gone / failed     Not enforced; `verdict` carries the new decision and reason.
+                          The outbox alert (notify) is left as it was.
         gone_unconfirmed  Found missing after a crash: gone, but not provably by ModBot.
-        superseded        Still present after a crash; re-checked as a new case, so no post for this one.
+        superseded        Still present after a crash and re-judged as a new case, which
+                          carries its own alert, so this one's is dropped.
         """
         if action == "done":
-            sql, args = "UPDATE cases SET action = 'done' WHERE case_id = ?", (case_id,)
+            sql, args = "UPDATE cases SET action = 'done' WHERE case_id = ? AND action = 'pending'", (case_id,)
         elif action == "gone_unconfirmed":
-            sql, args = "UPDATE cases SET action = ?, enforced = 0 WHERE case_id = ?", (action, case_id)
+            sql = "UPDATE cases SET action = ?, enforced = 0 WHERE case_id = ? AND action = 'pending'"
+            args = (action, case_id)
         elif action == "superseded":
             sql = ("UPDATE cases SET action = ?, enforced = 0, notify = NULL, "
-                   "reason = reason || '; restarted before delete, re-checked' WHERE case_id = ?")
+                   "reason = reason || '; restarted before delete, re-checked' "
+                   "WHERE case_id = ? AND action = 'pending'")
             args = (action, case_id)
         elif action in ("gone", "failed"):
             if verdict is None:
                 raise ValueError(f"finish_action({action!r}) needs the updated verdict")
-            sql = "UPDATE cases SET action = ?, enforced = 0, decision = ?, reason = ? WHERE case_id = ?"
+            sql = ("UPDATE cases SET action = ?, enforced = 0, decision = ?, reason = ? "
+                   "WHERE case_id = ? AND action = 'pending'")
             args = (action, verdict.decision.value, verdict.reason, case_id)
         else:
             raise ValueError(f"unknown action {action!r}")
-        await self.conn.execute(sql, args)
+        cur = await self.conn.execute(sql, args)
         await self.conn.commit()
+        return cur.rowcount > 0
 
     async def pending_actions(self) -> list[aiosqlite.Row]:
         async with self.conn.execute(
-            "SELECT case_id, channel_id, message_id, trigger FROM cases WHERE action = 'pending'"
+            "SELECT case_id, channel_id, message_id, trigger, rule_id, reason, ping FROM cases "
+            "WHERE action = 'pending' ORDER BY case_id"
         ) as cur:
             return list(await cur.fetchall())
 

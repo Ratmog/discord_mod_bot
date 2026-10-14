@@ -1,4 +1,4 @@
-discord.py>=2.4,<3
+discord.py>=2.5,<3  # 2.5 added RawMessageUpdateEvent.message (used by the edit handler)
 openai>=1.40
 aiosqlite>=0.20
 PyYAML>=6.0
