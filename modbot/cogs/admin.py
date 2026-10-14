@@ -11,8 +11,8 @@ from discord.ext import commands
 
 from modbot.cogs._util import to_input
 from modbot.db import now
-from modbot.links import parse_message_link
 from modbot.gateway import ModlogPost
+from modbot.links import parse_message_link
 from modbot.models import Trigger
 from modbot.moderation.pipeline import user_facing
 
