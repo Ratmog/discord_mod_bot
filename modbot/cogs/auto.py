@@ -54,6 +54,8 @@ class Auto(commands.Cog):
         return (
             msg.guild is not None
             and msg.guild.id == self.bot.config.guild_id
+            and msg.channel.id not in self.bot.config.exempt_channel_ids
+            and getattr(msg.channel, "parent_id", None) not in self.bot.config.exempt_channel_ids
             and not is_bot_account(msg)
             and bool(msg.content.strip())
         )
