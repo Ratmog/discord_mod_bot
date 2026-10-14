@@ -78,6 +78,15 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS settings_audit (
+    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 """
 
 # Columns added after a table first shipped. CREATE TABLE IF NOT EXISTS never
@@ -109,6 +118,7 @@ class Database:
         self._conn: aiosqlite.Connection | None = None
         self._settings: dict[str, str] = {}
         self._cooldown_lock = asyncio.Lock()
+        self._settings_lock = asyncio.Lock()
 
     @property
     def conn(self) -> aiosqlite.Connection:
@@ -151,6 +161,33 @@ class Database:
         )
         await self.conn.commit()
         self._settings[key] = value
+
+    async def set_setting_audited(self, key: str, value: str, admin_id: int) -> tuple[str | None, bool]:
+        """Write configuration and its audit row in the same savepoint."""
+        async with self._settings_lock:
+            old = self._settings.get(key)
+            if old == value:
+                return old, False
+            await self.conn.execute("SAVEPOINT settings_change")
+            try:
+                await self.conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+                await self.conn.execute(
+                    "INSERT INTO settings_audit(admin_id, key, old_value, new_value, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (admin_id, key, old, value, now()),
+                )
+                await self.conn.execute("RELEASE SAVEPOINT settings_change")
+                await self.conn.commit()
+            except BaseException:
+                await self.conn.execute("ROLLBACK TO SAVEPOINT settings_change")
+                await self.conn.execute("RELEASE SAVEPOINT settings_change")
+                raise
+            self._settings[key] = value
+            return old, True
 
     async def seed_setting(self, key: str, value: str) -> None:
         """Write only if missing: defaults seed once, then the database wins."""
