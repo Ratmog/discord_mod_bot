@@ -1,8 +1,17 @@
-"""Moderation pipeline: cached scores -> current rules -> act -> record.
+"""Moderation pipeline: cached scores -> current rules -> act -> record -> notify.
 
-Invariant: the expensive prediction is cached; the decision never is. Every
-trigger (auto, report, recheck) re-runs `evaluate()` against the current
-rules.yaml and the current enforce/dry-run settings.
+Invariants:
+- The expensive prediction is cached; the decision never is. Every trigger
+  (auto, report, recheck) re-runs `evaluate()` against the current rules.yaml
+  and the current enforce/dry-run settings.
+- At most one enforcement action per message at a time (reference-counted lock),
+  and nothing called while holding that lock re-enters it.
+- An enforced delete is recorded as `pending` before Discord is called, so a
+  crash leaves something `reconcile()` can resolve.
+- Mod-log posts go through an outbox (`cases.notify`): written as pending with
+  the case, marked sent once Discord accepts the post, retried by
+  `flush_notifications()` otherwise. At-least-once: a crash between a post and
+  its "sent" mark can repeat a post, which beats losing a child-safety alert.
 """
 
 from __future__ import annotations
@@ -14,28 +23,31 @@ from dataclasses import dataclass, replace
 
 from modbot.db import Database, now
 from modbot.gateway import Gateway, GoneError, ModlogPost, TransientError
-from modbot.models import Decision, ModerationInput, ModerationResult, Trigger, Verdict, content_hash
+from modbot.models import (
+    Decision,
+    ModerationInput,
+    ModerationResult,
+    Trigger,
+    Verdict,
+    content_hash,
+    snowflake_ts,
+)
 from modbot.moderation.base import Classifier
 from modbot.moderation.rules import RuleSet, evaluate
 
 log = logging.getLogger(__name__)
 
 AUTHOR_DM = (
-    "A message you posted was removed automatically by the server's filter. "
-    "If you were reporting or discussing abuse rather than joking, contact a moderator."
+    "A message you posted was removed automatically by the server's moderation filter. "
+    "If you think that was a mistake (for example, you were quoting or reporting something), "
+    "contact a moderator."
 )
 REPORT_FORM = "https://dis.gd/request"
 
 MAX_EDIT_RETRIES = 2  # re-judge an edited message at most this many times before giving up
-
-
-class _LockEntry:
-    __slots__ = ("lock", "refs")
-
-    def __init__(self) -> None:
-        self.lock = asyncio.Lock()
-        self.refs = 0
-
+OUTBOX_GRACE = 60  # seconds before the outbox retries a post the inline path may still be sending
+OUTBOX_MAX_AGE = 7 * 86400
+OUTBOX_BATCH = 20
 
 COLORS = {"deleted": 0xD83C3E, "would": 0xE8A33D, "flag": 0x5B8DEF, "error": 0x888888}
 
@@ -67,6 +79,19 @@ class Outcome:
     case_id: int | None
     deleted: bool = False
     gone: bool = False
+    scored: bool = True  # False = the classifier was unavailable; worth retrying later
+
+
+def _is_live_delete(v: Verdict) -> bool:
+    return v.decision is Decision.DELETE and v.enforced
+
+
+class _LockEntry:
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.refs = 0
 
 
 class Pipeline:
@@ -103,6 +128,7 @@ class Pipeline:
         return (inp.message_id, inp.hash, self.classifier.model_id)
 
     async def _scores(self, inps: list[ModerationInput]) -> list[ModerationResult | None]:
+        """Never awaits a message lock, so it's safe to call while holding one."""
         results: list[ModerationResult | None] = [None] * len(inps)
         waits: dict[int, asyncio.Future] = {}
         mine: list[int] = []
@@ -127,6 +153,8 @@ class Pipeline:
                 batch = [inps[i] for i in chunk]
                 try:
                     out = await self.classifier.classify(batch)
+                    if len(out) != len(batch):
+                        raise RuntimeError(f"classifier returned {len(out)} results for {len(batch)} inputs")
                 except Exception:
                     log.warning("classifier failed for %d message(s)", len(batch), exc_info=True)
                     out = [None] * len(batch)  # nothing cached, so the next trigger retries
@@ -150,88 +178,82 @@ class Pipeline:
     # ---- decide, act, record ------------------------------------------------
 
     async def _finish(self, inp: ModerationInput, result: ModerationResult | None, trigger: Trigger) -> Outcome:
-        rules = self.rules
-        report_count = 0
-        if trigger is Trigger.REPORT:
-            report_count = await self.db.prior_reports(inp.message_id, inp.hash) + 1
-
         if result is None:
-            verdict = Verdict.error("classifier unavailable; kept")
-            case_id = await self.db.append_case(inp, None, verdict, trigger.value, rules.version, report_count)
-            return Outcome(verdict, case_id)
+            return await self._record(inp, None, Verdict.error("classifier unavailable; kept"), trigger, scored=False)
+        verdict = evaluate(self.rules, result, self.flags, trigger)
+        if not _is_live_delete(verdict):
+            return await self._record(inp, result, verdict, trigger)
 
-        verdict = evaluate(rules, result, self.flags, trigger)
-        if not (verdict.decision is Decision.DELETE and verdict.enforced):
-            case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
-            return await self._report(inp, verdict, trigger, case_id, False, False, report_count)
-
-        # Enforced delete: one action per message at a time. The entry is
-        # reference-counted and only evicted when nobody holds or awaits it;
-        # Lock.locked() is False between a release and the next waiter waking.
+        # One enforcement action per message at a time. The entry is reference-counted
+        # and evicted only when nobody holds or awaits it: Lock.locked() is False
+        # between a release and the next waiter waking, so it can't be used for this.
         entry = self._locks.get(inp.message_id)
         if entry is None:
             entry = self._locks[inp.message_id] = _LockEntry()
         entry.refs += 1
         try:
             async with entry.lock:
-                return await self._enforce(inp, result, verdict, trigger, report_count)
+                return await self._enforce(inp, result, verdict, trigger)
         finally:
             entry.refs -= 1
             if entry.refs == 0 and self._locks.get(inp.message_id) is entry:
                 del self._locks[inp.message_id]
 
-    async def _record(self, inp, result, verdict, trigger, report_count, deleted=False, gone=False) -> Outcome:
-        case_id = await self.db.append_case(inp, result, verdict, trigger.value, self.rules.version, report_count)
-        return await self._report(inp, verdict, trigger, case_id, deleted, gone, report_count)
+    async def _record(
+        self, inp: ModerationInput, result: ModerationResult | None, verdict: Verdict, trigger: Trigger,
+        *, action: str | None = None, gone: bool = False, scored: bool = True,
+    ) -> Outcome:
+        case_id = await self.db.append_case(inp, result, verdict, trigger.value, self.rules.version, action=action)
+        if verdict.post:
+            await self._notify(case_id)
+        return Outcome(verdict, case_id, gone=gone, scored=scored)
 
     async def _enforce(
-        self, inp: ModerationInput, result: ModerationResult, verdict: Verdict, trigger: Trigger, report_count: int,
+        self, inp: ModerationInput, result: ModerationResult, verdict: Verdict, trigger: Trigger,
     ) -> Outcome:
         """Runs under the message's lock. Never calls back into _finish (the lock isn't reentrant)."""
         for attempt in range(MAX_EDIT_RETRIES + 1):
             if await self.db.already_deleted(inp.message_id):
+                # A concurrent caller already removed it: record, but no second post, DM or Discord call.
                 verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already removed")
                 case_id = await self.db.append_case(inp, result, verdict, trigger.value, self.rules.version,
-                                                    report_count)
-                return Outcome(verdict, case_id, gone=True)  # no second post, DM, or Discord call
+                                                    notify=False)
+                return Outcome(verdict, case_id, gone=True)
 
             try:
                 current = await self.gw.fetch_message(inp.channel_id, inp.message_id)
             except GoneError:
                 verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already gone")
-                return await self._record(inp, result, verdict, trigger, report_count, gone=True)
+                return await self._record(inp, result, verdict, trigger, action="gone", gone=True)
             except TransientError:
                 verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
                                   reason=verdict.reason + "; re-fetch failed, kept")
-                return await self._record(inp, result, verdict, trigger, report_count)
+                return await self._record(inp, result, verdict, trigger)
 
             if content_hash(current.content) == inp.hash:
                 break
             if attempt == MAX_EDIT_RETRIES:
                 verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
                                   reason=verdict.reason + "; message keeps changing, kept")
-                return await self._record(inp, result, verdict, trigger, report_count)
+                return await self._record(inp, result, verdict, trigger)
 
             # Edited since scoring: judge the current text, still under this lock.
             inp = replace(inp, content=current.content)
             new_result = (await self._scores([inp]))[0]
             if new_result is None:
-                return await self._record(inp, None, Verdict.error("classifier unavailable; kept"),
-                                          trigger, report_count)
+                return await self._record(inp, None, Verdict.error("classifier unavailable; kept"), trigger,
+                                          scored=False)
             result = new_result
             verdict = evaluate(self.rules, result, self.flags, trigger)
-            if not (verdict.decision is Decision.DELETE and verdict.enforced):
-                return await self._record(inp, result, verdict, trigger, report_count)
+            if not _is_live_delete(verdict):
+                return await self._record(inp, result, verdict, trigger)
 
         # Write the audit record BEFORE deleting, so a crash in between leaves a
         # pending action that reconcile() resolves on restart.
-        case_id = await self.db.append_case(inp, result, verdict, trigger.value, self.rules.version, report_count,
-                                            action="pending")
+        case_id = await self.db.append_case(inp, result, verdict, trigger.value, self.rules.version, action="pending")
         deleted = gone = False
         try:
             await self.gw.delete_message(inp.channel_id, inp.message_id)
-            deleted = True
-            await self.db.finish_action(case_id, "done")
         except GoneError:
             gone = True
             verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already gone")
@@ -240,71 +262,101 @@ class Pipeline:
             verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
                               reason=verdict.reason + "; delete failed, kept")
             await self.db.finish_action(case_id, "failed", verdict)
-        return await self._report(inp, verdict, trigger, case_id, deleted, gone, report_count)
+        else:
+            deleted = True
+            await self.db.finish_action(case_id, "done")
+        if verdict.post:
+            await self._notify(case_id)  # pings still fire when the delete failed: that's when they matter most
+        if deleted:
+            await self.gw.dm(inp.author_id, AUTHOR_DM)
+        return Outcome(verdict, case_id, deleted=deleted, gone=gone)
 
     async def reconcile(self) -> int:
         """Resolve deletions left 'pending' by a crash. Returns how many were resolved.
 
-        A missing message only proves the message is gone, not that ModBot deleted
-        it (a moderator may have), so it's recorded as gone_unconfirmed, not done.
+        Missing message: it's gone, but that doesn't prove ModBot deleted it (a
+        moderator may have), so it's gone_unconfirmed. Still present: the crash
+        hit before Discord got the DELETE, so the violation may still be up;
+        re-check it with current rules rather than leaving it.
         """
-        fixed = 0
-        for case_id, channel_id, message_id in await self.db.pending_actions():
+        resolved = 0
+        for row in await self.db.pending_actions():
             try:
-                await self.gw.fetch_message(channel_id, message_id)
+                current = await self.gw.fetch_message(row["channel_id"], row["message_id"])
             except GoneError:
-                await self.db.finish_action(case_id, "gone_unconfirmed")
+                await self.db.finish_action(row["case_id"], "gone_unconfirmed")
             except TransientError:
                 continue  # try again next start
             else:
-                await self.db.finish_action(case_id, "failed", None)  # still there: kept
-            fixed += 1
-        return fixed
+                await self.db.finish_action(row["case_id"], "superseded")
+                trigger = Trigger.AUTO if row["trigger"] == Trigger.AUTO.value else Trigger.RECHECK
+                inp = ModerationInput(current.message_id, current.channel_id, current.author_id, current.content)
+                await self.run(inp, trigger)
+            resolved += 1
+        return resolved
 
-    async def _report(
-        self, inp: ModerationInput, verdict: Verdict, trigger: Trigger, case_id: int,
-        deleted: bool, gone: bool, report_count: int,
-    ) -> Outcome:
-        if verdict.post:
-            await self.gw.post_modlog(await self._modlog_post(inp, verdict, trigger, case_id, deleted, report_count))
-        if deleted:
-            await self.gw.dm(inp.author_id, AUTHOR_DM)
-        return Outcome(verdict, case_id, deleted, gone)
+    # ---- mod-log outbox -----------------------------------------------------
 
-    async def _modlog_post(
-        self, inp: ModerationInput, v: Verdict, trigger: Trigger, case_id: int, deleted: bool, report_count: int
-    ) -> ModlogPost:
-        if deleted:
+    async def _notify(self, case_id: int) -> bool:
+        row = await self.db.get_case(case_id)
+        if row is None:
+            return False
+        ok = await self.gw.post_modlog(await self._build_post(row))
+        if ok:
+            await self.db.set_notified(case_id)
+        return ok
+
+    async def flush_notifications(self) -> int:
+        """Retry mod-log posts that didn't go through. Returns how many were sent."""
+        t = now()
+        sent = 0
+        for case_id in await self.db.pending_notifications(t - OUTBOX_GRACE, t - OUTBOX_MAX_AGE, OUTBOX_BATCH):
+            if not await self._notify(case_id):
+                break  # Discord is still refusing; try the rest next tick
+            sent += 1
+        return sent
+
+    async def _build_post(self, c) -> ModlogPost:
+        """A mod-log post built from the stored case, so inline posts and outbox retries match."""
+        action, decision = c["action"], c["decision"]
+        removed = action in ("done", "gone", "gone_unconfirmed")
+        if action == "done":
             title, color = "Deleted", COLORS["deleted"]
-        elif v.decision is Decision.DELETE:
+        elif action == "gone_unconfirmed":
+            title, color = "Gone (removal not confirmed)", COLORS["deleted"]
+        elif action == "gone":
+            title, color = "Already gone", COLORS["error"]
+        elif decision == Decision.DELETE.value:
             title, color = "Would delete (not enforced)", COLORS["would"]
-        elif v.decision is Decision.ERROR:
+        elif decision == Decision.ERROR.value:
             title, color = "Error, kept", COLORS["error"]
         else:
             title, color = "Flagged, kept", COLORS["flag"]
 
-        link = f"https://discord.com/channels/{self.guild_id}/{inp.channel_id}/{inp.message_id}"
-        ts = dt.datetime.fromtimestamp(now(), dt.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        link = f"https://discord.com/channels/{self.guild_id}/{c['channel_id']}/{c['message_id']}"
+        posted = dt.datetime.fromtimestamp(snowflake_ts(c["message_id"]), dt.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        trigger = c["trigger"] + (f" (reported {c['report_count']}x)" if c["report_count"] else "")
         fields = [
-            ("Rule", f"`{v.rule_id}`"),
-            ("Signal", v.reason),
-            ("Trigger", trigger.value + (f" (reported {report_count}x)" if report_count else "")),
-            ("Author", f"<@{inp.author_id}> (`{inp.author_id}`)"),
-            ("Message", f"{link}\n<#{inp.channel_id}> · {ts}"),
+            ("Rule", f"`{c['rule_id']}`"),
+            ("Signal", c["reason"] or "-"),
+            ("Trigger", trigger),
+            ("Author", f"<@{c['author_id']}> (`{c['author_id']}`)"),
+            ("Message", f"{link}\n<#{c['channel_id']}> · posted {posted}"),
+            ("Content", c["content"][:1000] if c["content"] is not None else "_redacted_"),
         ]
-        if not v.redact:
-            fields.append(("Content", inp.content[:1000]))
-        else:
-            fields.append(("Content", "_redacted_"))
-
-        ping = v.ping and deleted
+        ping = bool(c["ping"])
         if ping:
-            fields.append(("Next step", f"Report to Discord via the web form ({REPORT_FORM}) using the IDs "
-                                        "above; the in-app report no longer works on a deleted message."))
-            n = await self.db.flagged_deletions(inp.author_id, v.rule_id or "", now() - 30 * 86400)
+            if removed:
+                step = (f"Report it to Discord via the web form ({REPORT_FORM}) using the IDs above; "
+                        "the in-app report no longer works on a deleted message.")
+            else:
+                step = (f"The message may still be up: delete it manually, then report it to Discord "
+                        f"via the web form ({REPORT_FORM}).")
+            fields.append(("Next step", step))
+            n = await self.db.flagged_deletions(c["author_id"], c["rule_id"] or "", now() - 30 * 86400)
             if n >= 2:
-                fields.append(("Repeat offender", f"{n} enforced deletions under this rule in 30 days"))
-        return ModlogPost(f"Case #{case_id} · {title}", color, fields, case_id, ping=ping, buttons=True)
+                fields.append(("Repeat offender", f"{n} confirmed deletions under this rule in 30 days"))
+        return ModlogPost(f"Case #{c['case_id']} · {title}", color, fields, c["case_id"], ping=ping, buttons=True)
 
 
 def user_facing(outcome: Outcome) -> str:
@@ -313,8 +365,10 @@ def user_facing(outcome: Outcome) -> str:
         return "That message is already gone."
     if outcome.deleted:
         return "Thanks, that message was removed."
+    if not outcome.scored:
+        return "Couldn't check that message right now. Try again in a bit."
     if v.decision is Decision.ERROR:
-        return "Couldn't check that message right now; it's been logged. Try again in a bit."
+        return "Something went wrong acting on that message; it's been logged for the moderators."
     if v.decision in (Decision.DELETE, Decision.ESCALATE):
         return "Thanks, it's been logged for the moderators."
     return "Thanks, checked it: it doesn't break the server's rules."

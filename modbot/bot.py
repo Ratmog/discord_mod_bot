@@ -1,10 +1,11 @@
-"""Entry point: python -m modbot"""
+"""The bot process. Run with: python -m modbot"""
 
 from __future__ import annotations
 
 import logging
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from modbot.config import Config
@@ -17,7 +18,8 @@ from modbot.views import OutcomeButton
 
 log = logging.getLogger("modbot")
 
-COGS = ("modbot.cogs.reports", "modbot.cogs.auto", "modbot.cogs.cleanup", "modbot.cogs.admin")
+COGS = ("modbot.cogs.reports", "modbot.cogs.auto", "modbot.cogs.cleanup", "modbot.cogs.outbox",
+        "modbot.cogs.admin")
 REQUIRED_PERMS = ("view_channel", "read_message_history", "send_messages", "embed_links", "manage_messages")
 
 
@@ -43,6 +45,7 @@ class ModBot(commands.Bot):
         classifier = OpenAIModerationClassifier(self.config.openai_api_key, self.config.openai_rpm)
         self.pipeline = Pipeline(self.db, classifier, self.gateway, self.rules, self.config.guild_id)
         self.add_dynamic_items(OutcomeButton)
+        self.tree.error(self._on_tree_error)
         for cog in COGS:
             await self.load_extension(cog)
         guild = discord.Object(id=self.config.guild_id)
@@ -62,13 +65,42 @@ class ModBot(commands.Bot):
         if guild is None:
             log.error("bot is not in guild %s", self.config.guild_id)
             return
+        problems = []
         missing = [p for p in REQUIRED_PERMS if not getattr(guild.me.guild_permissions, p)]
         if missing:
-            log.warning("missing server permissions: %s", ", ".join(missing))
-            await self.gateway.post_modlog(ModlogPost(
-                "ModBot is missing permissions", 0xD83C3E, [("Missing", ", ".join(missing))]))
+            problems.append(("Missing permissions", ", ".join(missing)))
+        role_id = self.config.mod_role_id
+        if role_id:
+            role = guild.get_role(role_id)
+            if role is None:
+                problems.append(("Moderator role", f"MOD_ROLE_ID {role_id} doesn't exist in this server"))
+            elif not role.mentionable and not guild.me.guild_permissions.mention_everyone:
+                problems.append(("Moderator pings won't notify", f"Make @{role.name} mentionable, or give ModBot "
+                                 "the 'Mention @everyone, @here, and All Roles' permission"))
+        if problems:
+            for name, value in problems:
+                log.warning("%s: %s", name, value)
+            await self.gateway.post_modlog(ModlogPost("ModBot setup problems", 0xD83C3E, problems))
+
+    async def _on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        if isinstance(error, app_commands.CheckFailure):
+            return  # the check already told the user why
+        log.error("command %s failed", getattr(interaction.command, "qualified_name", "?"), exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("Something went wrong.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Something went wrong.", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
     async def close(self) -> None:
+        # Stop workers and loops before the database closes under them.
+        for ext in list(self.extensions):
+            try:
+                await self.unload_extension(ext)
+            except Exception:
+                log.exception("failed to unload %s", ext)
         await super().close()
         await self.db.close()
 
@@ -77,7 +109,3 @@ def main() -> None:
     config = Config.from_env()
     logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     ModBot(config).run(config.discord_token, log_handler=None)
-
-
-if __name__ == "__main__":
-    main()

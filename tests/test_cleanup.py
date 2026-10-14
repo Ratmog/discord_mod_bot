@@ -1,6 +1,6 @@
 from modbot.cleanup import DISCORD_EPOCH_MS, snowflake_ts, sweep
 
-from .conftest import FakeGateway
+from .conftest import FakeGateway, cleanup_status
 
 
 def sf(ts: int, n: int = 0) -> int:
@@ -26,7 +26,7 @@ async def test_only_due_messages_swept(db):
     await enqueue(db, [old, young])
     r = await sweep(db, gw, NOW)
     assert gw.deleted == [old] and r.deleted == 1
-    assert await db.cleanup_status(young) == "pending"
+    assert await cleanup_status(db, young) == "pending"
 
 
 async def test_single_uses_single_delete(db):
@@ -70,10 +70,10 @@ async def test_failed_chunk_stays_pending_then_fails_after_5(db):
     for _attempt in range(4):
         r = await sweep(db, gw, NOW)
         assert r.failed == []
-        assert await db.cleanup_status(ids[0]) == "pending"
+        assert await cleanup_status(db, ids[0]) == "pending"
     r = await sweep(db, gw, NOW)
     assert sorted(r.failed) == sorted(ids)
-    assert await db.cleanup_status(ids[0]) == "failed"
+    assert await cleanup_status(db, ids[0]) == "failed"
 
 
 async def test_single_gone_marked_gone(db):
@@ -82,7 +82,7 @@ async def test_single_gone_marked_gone(db):
     gw.gone_ids = {i}
     await enqueue(db, [i])
     r = await sweep(db, gw, NOW)
-    assert r.gone == 1 and await db.cleanup_status(i) == "gone"
+    assert r.gone == 1 and await cleanup_status(db, i) == "gone"
 
 
 async def test_enqueue_is_idempotent_and_restart_safe(db):

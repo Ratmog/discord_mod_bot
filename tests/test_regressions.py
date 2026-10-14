@@ -4,7 +4,7 @@ import asyncio
 
 import aiosqlite
 
-from modbot.db import Database
+from modbot.db import MIGRATIONS, Database
 from modbot.models import Decision, ModerationInput, ModerationResult, Trigger
 from modbot.moderation.pipeline import Pipeline, seed_rule_settings
 from modbot.moderation.rules import StaticFlags, evaluate
@@ -70,7 +70,7 @@ async def test_existing_database_migrates(tmp_path):
     await db.connect()  # f81cea0: OperationalError: no such column: action
     async with db.conn.execute("PRAGMA table_info(cases)") as cur:
         cols = {r["name"] async for r in cur}
-    assert "action" in cols
+    assert {column for table, column, _ in MIGRATIONS if table == "cases"} <= cols
     async with db.conn.execute("SELECT COUNT(*) AS n FROM cases") as cur:
         assert (await cur.fetchone())["n"] == 1  # old rows kept
     await db.close()

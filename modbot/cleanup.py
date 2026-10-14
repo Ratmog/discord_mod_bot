@@ -10,18 +10,13 @@ from dataclasses import dataclass, field
 
 from modbot.db import Database, now
 from modbot.gateway import Gateway, GoneError, TransientError
+from modbot.models import DISCORD_EPOCH_MS, snowflake_ts  # noqa: F401  (re-exported for callers/tests)
 
 log = logging.getLogger(__name__)
 
-DISCORD_EPOCH_MS = 1420070400000
-LIFETIME = 300  # seconds a game-bot message lives
+LIFETIME = 300  # seconds a game-bot message lives; the clock comes from the ID, so restarts never reset it
 BULK_MAX_AGE = int(13.5 * 86400)  # bulk delete refuses messages over 14 days old
 BULK_MAX = 100
-
-
-def snowflake_ts(snowflake: int) -> int:
-    """Creation time (unix seconds) from the ID itself, so restarts never reset the clock."""
-    return ((snowflake >> 22) + DISCORD_EPOCH_MS) // 1000
 
 
 @dataclass

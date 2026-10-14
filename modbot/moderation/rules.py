@@ -102,10 +102,6 @@ class RuleSet:
     def get(self, rule_id: str) -> Rule | None:
         return next((r for r in self.rules if r.id == rule_id), None)
 
-    @property
-    def categories(self) -> set[str]:
-        return {c for r in self.rules for c in r.categories}
-
 
 _RANK = {Decision.DELETE: 2, Decision.ESCALATE: 1}
 
@@ -118,8 +114,11 @@ def _evaluate_rule(rule: Rule, result: ModerationResult, flags: Flags, key: str)
     def verdict(decision: Decision, reason: str, enforced: bool, ping: bool) -> Verdict:
         return Verdict(decision, rule.id, reason, enforced, ping, True, rule.redact)
 
-    if rule.delete_if_flagged and result.flagged.get(cat, False):
-        return verdict(Decision.DELETE, f"{cat} flagged by classifier ({score:.2f})", live, rule.ping)
+    flagged = [c for c in rule.categories if result.flagged.get(c, False)]  # any category, not just the max
+    if rule.delete_if_flagged and flagged:
+        c = flagged[0]
+        return verdict(Decision.DELETE, f"{c} flagged by classifier ({result.scores.get(c, 0.0):.2f})",
+                       live, rule.ping)
     cutoff = rule.delete_at.get(key)
     suppressed = not rule.ignores_context and any(
         result.context.get(label, 0.0) >= t for label, t in rule.suppress_if.items()
@@ -139,8 +138,9 @@ def evaluate(rules: RuleSet, result: ModerationResult, flags: Flags, trigger: Tr
 
     Every rule is evaluated; the most severe outcome wins (live delete, then
     would-delete, then flag), with rule order breaking ties. A weak signal from
-    an early rule can't mask a strong one from a later rule. Redaction is sticky:
-    if any matching rule redacts, the final verdict does too.
+    an early rule can't mask a strong one from a later rule. Redaction and pings
+    are sticky: if any matching rule redacts or wants moderators pinged, the final
+    verdict does too, even when a different rule decides the action.
     """
     key = trigger.threshold_key
     matches = [(i, v) for i, rule in enumerate(rules.rules)
@@ -151,7 +151,8 @@ def evaluate(rules: RuleSet, result: ModerationResult, flags: Flags, trigger: Tr
                                            _RANK.get(iv[1].decision, 0), -iv[0]))
     others = [v for _, v in matches if v is not best]
     redact = best.redact or any(v.redact for v in others)
+    ping = best.ping or any(v.ping for v in others)
     reason = best.reason
     if others:
         reason += "; also " + ", ".join(f"{v.rule_id} ({v.reason})" for v in others)
-    return replace(best, redact=redact, reason=reason)
+    return replace(best, redact=redact, ping=ping, reason=reason)

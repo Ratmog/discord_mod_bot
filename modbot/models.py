@@ -28,6 +28,14 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+DISCORD_EPOCH_MS = 1420070400000
+
+
+def snowflake_ts(snowflake: int) -> int:
+    """Creation time (unix seconds) encoded in a Discord ID."""
+    return ((snowflake >> 22) + DISCORD_EPOCH_MS) // 1000
+
+
 @dataclass(frozen=True)
 class ModerationInput:
     message_id: int

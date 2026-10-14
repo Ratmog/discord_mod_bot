@@ -73,7 +73,9 @@ async def test_report_count_increments(db, rules):
     m = msg(5, "z")
     for _ in range(3):
         await p.run(m, Trigger.REPORT)
-    assert await db.prior_reports(5, m.hash) == 3
+    await p.run(m, Trigger.AUTO)  # auto runs don't count as reports
+    async with db.conn.execute("SELECT report_count FROM cases WHERE message_id = 5 ORDER BY case_id") as cur:
+        assert [r["report_count"] async for r in cur] == [1, 2, 3, 0]
 
 
 async def test_batching(db, rules):

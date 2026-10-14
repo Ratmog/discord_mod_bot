@@ -11,7 +11,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from modbot.cogs._util import to_input
+from modbot.cogs._util import is_bot_account, to_input
 from modbot.links import parse_message_link
 from modbot.models import Trigger
 from modbot.moderation.pipeline import user_facing
@@ -77,14 +77,14 @@ class Reports(commands.Cog):
         if message.guild is None or message.guild.id != self.bot.config.guild_id:
             await interaction.followup.send("That isn't a message from this server.", ephemeral=True)
             return
-        if message.author.bot:
+        if is_bot_account(message):
             await interaction.followup.send("Bot messages aren't moderated.", ephemeral=True)
             return
         if not message.content.strip():
             await interaction.followup.send("There's no text in that message for me to check.", ephemeral=True)
             return
         if not await self.bot.db.report_allowed(self._reporter_hash(interaction.user.id)):
-            await interaction.followup.send("Slow down a bit: try again in a minute.", ephemeral=True)
+            await interaction.followup.send("You've reported a lot just now; try again shortly.", ephemeral=True)
             return
         try:
             outcome = await self.bot.pipeline.run(to_input(message), Trigger.REPORT)

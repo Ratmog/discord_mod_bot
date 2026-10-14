@@ -15,8 +15,8 @@ import discord
 from discord.ext import commands
 
 from modbot.autoqueue import AutoQueue
-from modbot.cogs._util import to_input
-from modbot.models import ModerationInput, Trigger
+from modbot.cogs._util import is_bot_account, to_input
+from modbot.models import ModerationInput, Trigger, content_hash
 from modbot.priority import is_high_priority
 
 if TYPE_CHECKING:
@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 WORKERS = 2
 LINGER = 0.5  # seconds to wait for more messages so bursts go out as one batch
+MAX_RETRIES = 3  # re-score after a classifier outage, with growing delays
+RETRY_DELAY = 30  # seconds x attempt number
 
 
 class Auto(commands.Cog):
@@ -32,6 +34,8 @@ class Auto(commands.Cog):
         self.bot = bot
         self.queue: AutoQueue[ModerationInput] = AutoQueue(maxsize=500)
         self._workers: list[asyncio.Task] = []
+        self._retry_handles: set[asyncio.TimerHandle] = set()
+        self._attempts: dict[tuple[int, str], int] = {}
         self._last_dropped = 0
         self._last_dropped_high = 0
 
@@ -41,21 +45,21 @@ class Auto(commands.Cog):
     async def cog_unload(self) -> None:
         for t in self._workers:
             t.cancel()
+        for h in self._retry_handles:
+            h.cancel()
 
     def _eligible(self, msg: discord.Message) -> bool:
-        cfg = self.bot.config
+        # Messages that @ a game bot are still scored: exempting them would let
+        # anyone bypass moderation by mentioning Pokétwo.
         return (
             msg.guild is not None
-            and msg.guild.id == cfg.guild_id
-            and not msg.author.bot
-            and not msg.webhook_id
+            and msg.guild.id == self.bot.config.guild_id
+            and not is_bot_account(msg)
             and bool(msg.content.strip())
-            # Messages that mention or reply to a game bot are still scored: exempting
-            # them would let anyone bypass moderation by @-ing Pokétwo.
         )
 
-    def _enqueue(self, msg: discord.Message) -> None:
-        self.queue.put(to_input(msg), high=is_high_priority(msg.content))
+    def _enqueue(self, inp: ModerationInput) -> None:
+        self.queue.put(inp, high=is_high_priority(inp.content))
         if self.queue.dropped != self._last_dropped:
             log.warning("auto queue overflow: %d normal-priority messages dropped so far", self.queue.dropped)
             self._last_dropped = self.queue.dropped
@@ -67,28 +71,38 @@ class Auto(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message) -> None:
         if self._eligible(msg):
-            self._enqueue(msg)
+            self._enqueue(to_input(msg))
 
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
-        # Embed unfurls fire edits with no content change; skip before touching the DB.
-        new_content = payload.data.get("content")
-        if new_content is None:
-            return
-        cached = payload.cached_message
-        if cached is not None and cached.content == new_content:
-            return
         if payload.guild_id != self.bot.config.guild_id:
             return
-        channel = self.bot.get_channel(payload.channel_id)
-        if channel is None or not hasattr(channel, "fetch_message"):
+        msg = payload.message  # the full updated message; no fetch needed
+        cached = payload.cached_message
+        if cached is not None and cached.content == msg.content:
+            return  # embed unfurl or pin, not a text edit
+        if not self._eligible(msg):
             return
-        try:
-            msg = await channel.fetch_message(payload.message_id)
-        except discord.HTTPException:
+        if await self.bot.db.has_case(msg.id, content_hash(msg.content)):
+            return  # this exact text was already judged (uncached unfurl edits land here)
+        self._enqueue(to_input(msg))  # new text -> new score -> new case row
+
+    def _schedule_retry(self, inp: ModerationInput) -> None:
+        key = (inp.message_id, inp.hash)
+        n = self._attempts.get(key, 0) + 1
+        if n > MAX_RETRIES:
+            self._attempts.pop(key, None)
+            log.warning("giving up on message %s after %d classifier failures", inp.message_id, MAX_RETRIES)
             return
-        if self._eligible(msg):
-            self._enqueue(msg)  # new hash -> new score -> new case row
+        self._attempts[key] = n
+        loop = asyncio.get_running_loop()
+
+        def fire() -> None:
+            self._retry_handles.discard(handle)
+            self._enqueue(inp)
+
+        handle = loop.call_later(RETRY_DELAY * n, fire)
+        self._retry_handles.add(handle)
 
     async def _worker(self, n: int) -> None:
         clf = self.bot.pipeline.classifier
@@ -97,7 +111,12 @@ class Auto(commands.Cog):
                 batch = await self.queue.take(clf.max_batch, linger=LINGER)
                 if not batch:  # the other worker took everything during the linger
                     continue
-                await self.bot.pipeline.run_many(batch, Trigger.AUTO)
+                outcomes = await self.bot.pipeline.run_many(batch, Trigger.AUTO)
+                for inp, outcome in zip(batch, outcomes, strict=True):
+                    if outcome.scored:
+                        self._attempts.pop((inp.message_id, inp.hash), None)
+                    else:  # classifier was down: don't let these go unchecked forever
+                        self._schedule_retry(inp)
             except asyncio.CancelledError:
                 raise
             except Exception:

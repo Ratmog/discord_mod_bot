@@ -28,12 +28,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 CATCHUP_WINDOW = 2 * 3600
+WARN_EVERY = 3600  # at most one "cleanup failing" post per hour
 
 
 class Cleanup(commands.Cog):
     def __init__(self, bot: ModBot):
         self.bot = bot
         self._seen_ready = False
+        self._last_warn = 0
+        self._no_perm_logged: set[int] = set()
 
     async def cog_load(self) -> None:
         self.sweeper.start()
@@ -51,9 +54,18 @@ class Cleanup(commands.Cog):
             return True
         return cfg.cleanup_include_commands and not msg.author.bot and is_game_command(msg, cfg.game_bot_ids)
 
+    def _can_delete_in(self, channel) -> bool:
+        me = channel.guild.me
+        ok = channel.permissions_for(me).manage_messages
+        if not ok and channel.id not in self._no_perm_logged:
+            self._no_perm_logged.add(channel.id)  # log once per channel, don't queue doomed deletes
+            log.warning("no Manage Messages in #%s (%s); game messages there won't be cleaned",
+                        getattr(channel, "name", "?"), channel.id)
+        return ok
+
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message) -> None:
-        if self._should_clean(msg):
+        if self._should_clean(msg) and self._can_delete_in(msg.channel):
             await self.bot.db.enqueue_cleanup(msg.id, msg.channel.id, snowflake_ts(msg.id))
 
     def _channels(self) -> list[discord.abc.Messageable]:
@@ -87,9 +99,8 @@ class Cleanup(commands.Cog):
             return
         await self.catch_up()
 
-    def _catchup_since(self) -> int:
+    def _catchup_since(self, down: str | None) -> int:
         db = self.bot.db
-        down = db.setting("gateway_down_since")
         candidates = [int(down)] if down else []
         hb = db.last_heartbeat()
         if hb:
@@ -99,7 +110,8 @@ class Cleanup(commands.Cog):
 
     async def catch_up(self) -> None:
         """Game messages the bot never saw: bounded window, paginated to the end (INSERT OR IGNORE)."""
-        since = self._catchup_since()
+        down = self.bot.db.setting("gateway_down_since")
+        since = self._catchup_since(down)
         after = dt.datetime.fromtimestamp(since, dt.UTC)
         found = 0
         for ch in self._channels():
@@ -110,36 +122,42 @@ class Cleanup(commands.Cog):
                         found += 1
             except discord.HTTPException:
                 log.warning("catch-up failed for channel %s", ch.id, exc_info=True)
-        await self.bot.db.set_setting("gateway_down_since", "")
+        # Clear the checkpoint only if no new disconnect was recorded during the scan.
+        if self.bot.db.setting("gateway_down_since") == down:
+            await self.bot.db.set_setting("gateway_down_since", "")
         log.info("cleanup catch-up queued %d message(s)", found)
 
     @tasks.loop(seconds=60)
     async def sweeper(self) -> None:
-        if self.sweeper.current_loop == 0:
-            await self.catch_up()  # first iteration only; on_ready repeats on IDENTIFY and isn't safe
-        report = await sweep(self.bot.db, self.bot.gateway)
-        if report.deleted or report.gone or report.retried:
-            log.info("sweep: deleted=%d gone=%d retried=%d", report.deleted, report.gone, report.retried)
-        if report.failed:
-            await self.bot.gateway.post_modlog(ModlogPost(
-                "Cleanup failing", 0x888888,
-                [("Messages", f"{len(report.failed)} game message(s) failed 5 deletion attempts. "
-                              "Check the bot still has Manage Messages in those channels.")],
-            ))
-        await self.bot.db.heartbeat()
+        # Errors are caught here rather than in a loop error handler: an uncaught
+        # exception stops a tasks.loop, and cleanup must keep running.
+        try:
+            if self.sweeper.current_loop == 0:
+                await self.catch_up()  # first iteration only; on_ready repeats on IDENTIFY
+            report = await sweep(self.bot.db, self.bot.gateway)
+            if report.deleted or report.gone or report.retried:
+                log.info("sweep: deleted=%d gone=%d retried=%d", report.deleted, report.gone, report.retried)
+            if report.failed and now() - self._last_warn >= WARN_EVERY:
+                self._last_warn = now()
+                await self.bot.gateway.post_modlog(ModlogPost(
+                    "Cleanup failing", 0x888888,
+                    [("Messages", f"{len(report.failed)} game message(s) failed 5 deletion attempts. "
+                                  "Check the bot still has Manage Messages in those channels.")],
+                ))
+            await self.bot.db.heartbeat()
+        except Exception:
+            log.exception("sweep failed; will retry next minute")
 
     @sweeper.before_loop
     async def _before_sweep(self) -> None:
         await self.bot.wait_until_ready()
 
-    @sweeper.error
-    async def _sweep_error(self, error: BaseException) -> None:
-        log.exception("sweeper crashed; restarting", exc_info=error)
-        self.sweeper.restart()
-
     @tasks.loop(hours=24)
     async def maintenance(self) -> None:
-        await self.bot.db.purge()
+        try:
+            await self.bot.db.purge()
+        except Exception:
+            log.exception("retention purge failed; will retry tomorrow")
 
     @maintenance.before_loop
     async def _before_maint(self) -> None:

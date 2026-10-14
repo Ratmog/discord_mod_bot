@@ -50,6 +50,7 @@ class FakeGateway:
         self.posts: list[ModlogPost] = []
         self.fail_ids: set[int] = set()  # transient failures
         self.gone_ids: set[int] = set()
+        self.fail_posts = False
 
     def add(self, inp: ModerationInput) -> None:
         self.messages[inp.message_id] = FetchedMessage(inp.message_id, inp.channel_id, inp.author_id, inp.content)
@@ -82,7 +83,16 @@ class FakeGateway:
         return True
 
     async def post_modlog(self, post):
+        if self.fail_posts:
+            return False
         self.posts.append(post)
+        return True
+
+
+async def cleanup_status(db, message_id: int) -> str | None:
+    async with db.conn.execute("SELECT status FROM cleanup_queue WHERE message_id = ?", (message_id,)) as cur:
+        row = await cur.fetchone()
+    return row["status"] if row else None
 
 
 @pytest.fixture

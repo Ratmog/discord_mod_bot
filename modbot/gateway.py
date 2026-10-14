@@ -48,7 +48,7 @@ class Gateway(Protocol):
     async def delete_message(self, channel_id: int, message_id: int) -> None: ...
     async def bulk_delete(self, channel_id: int, message_ids: list[int]) -> None: ...
     async def dm(self, user_id: int, text: str) -> bool: ...
-    async def post_modlog(self, post: ModlogPost) -> None: ...
+    async def post_modlog(self, post: ModlogPost) -> bool: ...  # True once Discord accepted it
 
 
 class DiscordGateway:
@@ -119,7 +119,7 @@ class DiscordGateway:
             log.warning("DM to %s failed", user_id, exc_info=True)
             return False
 
-    async def post_modlog(self, post: ModlogPost) -> None:
+    async def post_modlog(self, post: ModlogPost) -> bool:
         import discord
 
         from modbot.views import outcome_view
@@ -128,7 +128,7 @@ class DiscordGateway:
             ch = await self._channel(self.modlog_channel_id)
         except (GoneError, TransientError):
             log.error("mod-log channel %s unavailable", self.modlog_channel_id)
-            return
+            return False
         embed = discord.Embed(title=post.title, color=post.color)
         for name, value in post.fields:
             embed.add_field(name=name, value=value[:1024] or "-", inline=False)
@@ -142,3 +142,5 @@ class DiscordGateway:
             await ch.send(**kwargs)
         except discord.HTTPException:
             log.exception("failed to post to mod-log")
+            return False
+        return True

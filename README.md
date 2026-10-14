@@ -3,7 +3,7 @@
 A Discord moderation bot for a server where edgy humor is normal but a few things are not:
 
 - **Private reports.** `/report <message link>` or right-click a message → Apps → **Report to ModBot**. Replies are visible only to the reporter, and reporter identity is never stored (only an HMAC, for the cooldown).
-- **Auto dry-run.** Every human message is scored with OpenAI Moderation (free). Rules start unenforced and only log what they *would* do, so thresholds can be calibrated on real traffic before anything is deleted.
+- **Auto dry-run.** Every human message is scored (including messages sent through proxy bots like PluralKit, which post via webhooks) with OpenAI Moderation (free). Rules start unenforced and only log what they *would* do, so thresholds can be calibrated on real traffic before anything is deleted.
 - **Child safety, live from day one.** `sexual/minors` content is deleted on OpenAI's own flag even in dry-run, the text is never stored, and moderators are pinged.
 - **Game-bot cleanup.** Pokétwo and Lawliet messages are deleted 5–6 minutes after they post, surviving restarts.
 
@@ -26,7 +26,7 @@ Only the expensive classifier call is cached; decisions are recomputed for every
 
 1. **Create the app** at <https://discord.com/developers/applications> → Bot. Turn on **Message Content Intent**. Copy the token.
 2. **Invite it** with scopes `bot` + `applications.commands` and permissions: View Channels, Read Message History, Send Messages, Embed Links, Manage Messages.
-3. **Create a private `#mod-logs` channel** the bot can post in, and (optionally) a moderator role to ping.
+3. **Create a private `#mod-logs` channel** the bot can post in, and (optionally) a moderator role to ping. Make that role **mentionable**, or give ModBot "Mention @everyone, @here, and All Roles"; otherwise pings show up but notify nobody. ModBot checks this on startup and posts any setup problems to `#mod-logs`.
 4. **Configure:**
    ```bash
    python3.11 -m venv venv && . venv/bin/activate
@@ -45,9 +45,16 @@ Commands sync to your guild on startup, so they appear immediately.
 | `/modbot dryrun on\|off` | Global override. Child safety ignores it. |
 | `/modbot enforce <rule> on\|off` | Turn deletion on for one rule. The only writer of enforce state after first start. |
 | `/modbot stats` | Cases by rule, decision and trigger for the last 7 days, plus queue health. |
-| `/modbot recheck <link>` | Re-score a message using report thresholds. |
+| `/modbot recheck <link>` | Re-judge a message against current rules with report thresholds. Deletes it if that rule is enforced. |
 
 Each `#mod-logs` post has **Violation / Fine** buttons. Marking cases is optional, but those marks are the calibration data for picking real thresholds.
+
+## Reliability guarantees
+
+- **One action per message.** Concurrent reports of the same message cause exactly one Discord delete.
+- **Audit before action.** An enforced delete is recorded as `pending` before Discord is called. On restart, a message that's still up is re-judged and removed if it still breaks a rule; one that's gone is recorded as `gone_unconfirmed`, since ModBot can't prove it was the one that deleted it.
+- **Mod-log posts can't be lost.** Each post is queued with its case and retried every minute until Discord accepts it, so a crash or outage can't silently drop a child-safety alert. (A crash at exactly the wrong moment can repeat a post; it can't drop one.)
+- **Outages are retried.** Messages that arrive while OpenAI is down are re-scored up to 3 times with growing delays.
 
 ## Rollout
 

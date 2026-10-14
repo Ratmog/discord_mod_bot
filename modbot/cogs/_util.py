@@ -13,6 +13,15 @@ def to_input(msg: discord.Message) -> ModerationInput:
     return ModerationInput(msg.id, msg.channel.id, msg.author.id, msg.content, parent)
 
 
+def is_bot_account(msg: discord.Message) -> bool:
+    """A real bot or system account. Webhook messages are NOT: proxy bots like
+    PluralKit/Tupperbox post people's words through webhooks, and exempting them
+    would let anyone bypass moderation."""
+    if msg.webhook_id is not None:
+        return False
+    return msg.author.bot or getattr(msg.author, "system", False)
+
+
 def is_game_command(msg: discord.Message, game_bot_ids: frozenset[int]) -> bool:
     """A member's message aimed at a game bot: mentions one, or replies to one."""
     if any(u.id in game_bot_ids for u in msg.mentions):

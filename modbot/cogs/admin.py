@@ -76,10 +76,14 @@ class ModbotGroup(app_commands.Group, name="modbot", description="ModBot adminis
             lines.append("No cases in the last 7 days.")
         auto = self.bot.get_cog("Auto")
         if auto is not None:
-            lines.append(f"Auto queue: {len(auto.queue)} waiting, {auto.queue.dropped} dropped since start")
+            lines.append(f"Auto queue: {len(auto.queue)} waiting; dropped since start: "
+                         f"{auto.queue.dropped} normal, {auto.queue.dropped_high} high-priority")
         await interaction.response.send_message("\n".join(lines)[:2000], ephemeral=True)
 
-    @app_commands.command(name="recheck", description="Re-score a message (uses report thresholds)")
+    @app_commands.command(
+        name="recheck",
+        description="Re-judge a message against current rules with report thresholds (deletes if enforced)",
+    )
     async def recheck(self, interaction: discord.Interaction, link: str) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         parsed = parse_message_link(link)

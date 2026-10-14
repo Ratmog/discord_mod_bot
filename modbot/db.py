@@ -1,7 +1,14 @@
-"""SQLite storage (WAL). One connection; aiosqlite runs it on its own thread."""
+"""SQLite storage (WAL). One connection; aiosqlite runs it on its own thread.
+
+Every public method is one atomic step from the caller's point of view: either a
+single SQL statement, or a read-modify-write guarded by an asyncio lock. Callers
+on the same event loop interleave between awaits, so multi-statement logic
+without a lock is a race.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections import defaultdict
@@ -52,9 +59,11 @@ CREATE TABLE IF NOT EXISTS cases (
     decision       TEXT    NOT NULL,     -- DELETE | KEEP | ESCALATE | ERROR
     rule_id        TEXT,
     reason         TEXT,
-    enforced       INTEGER NOT NULL,     -- 0 = would-have-acted
+    enforced       INTEGER NOT NULL,     -- 1 only while/after ModBot's own delete is pending/confirmed
     mod_outcome    TEXT,                 -- optional: violation | fine
-    action         TEXT,                 -- enforced delete: pending | done | gone | gone_unconfirmed | failed
+    action         TEXT,                 -- pending | done | gone | gone_unconfirmed | failed | superseded
+    notify         TEXT,                 -- mod-log outbox: pending | sent | NULL (no post)
+    ping           INTEGER NOT NULL DEFAULT 0,
     created_at     INTEGER NOT NULL
 );
 
@@ -71,20 +80,22 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 """
 
-
 # Columns added after a table first shipped. CREATE TABLE IF NOT EXISTS never
 # alters an existing table, so each one is added explicitly on connect.
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("cases", "action", "TEXT"),
+    ("cases", "notify", "TEXT"),
+    ("cases", "ping", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 # Indexes run after migrations, since they may reference migrated columns.
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_cleanup_due ON cleanup_queue(status, created_at);
-CREATE INDEX IF NOT EXISTS idx_cases_msg ON cases(message_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cases_msg ON cases(message_id, content_hash, trigger);
 CREATE INDEX IF NOT EXISTS idx_cases_calib ON cases(rule_id, decision, enforced);
 CREATE INDEX IF NOT EXISTS idx_cases_author ON cases(author_id, rule_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_cases_action ON cases(action) WHERE action = 'pending';
+CREATE INDEX IF NOT EXISTS idx_cases_notify ON cases(notify) WHERE notify = 'pending';
 """
 
 
@@ -97,6 +108,7 @@ class Database:
         self.path = path
         self._conn: aiosqlite.Connection | None = None
         self._settings: dict[str, str] = {}
+        self._cooldown_lock = asyncio.Lock()
 
     @property
     def conn(self) -> aiosqlite.Connection:
@@ -182,6 +194,8 @@ class Database:
 
     async def bump_cleanup_attempts(self, ids: list[int], error: str, max_attempts: int = 5) -> list[int]:
         """Record a failure; rows that reach max_attempts become 'failed'. Returns those ids."""
+        if not ids:
+            return []
         await self.conn.executemany(
             "UPDATE cleanup_queue SET attempts = attempts + 1, last_error = ?, updated_at = ?, "
             "status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE status END "
@@ -189,20 +203,11 @@ class Database:
             [(error[:500], now(), max_attempts, i) for i in ids],
         )
         await self.conn.commit()
-        if not ids:
-            return []
         q = ",".join("?" * len(ids))
         async with self.conn.execute(
             f"SELECT message_id FROM cleanup_queue WHERE status = 'failed' AND message_id IN ({q})", ids
         ) as cur:
             return [r["message_id"] async for r in cur]
-
-    async def cleanup_status(self, message_id: int) -> str | None:
-        async with self.conn.execute(
-            "SELECT status FROM cleanup_queue WHERE message_id = ?", (message_id,)
-        ) as cur:
-            row = await cur.fetchone()
-        return row["status"] if row else None
 
     # ---- scores cache (expensive part only; never decisions) ----------------
 
@@ -229,14 +234,7 @@ class Database:
         )
         await self.conn.commit()
 
-    # ---- cases (append-only history) ----------------------------------------
-
-    async def prior_reports(self, message_id: int, chash: str) -> int:
-        async with self.conn.execute(
-            "SELECT COUNT(*) AS n FROM cases WHERE message_id = ? AND content_hash = ? AND trigger = 'report'",
-            (message_id, chash),
-        ) as cur:
-            return (await cur.fetchone())["n"]
+    # ---- cases (append-only history + mod-log outbox) -----------------------
 
     async def append_case(
         self,
@@ -245,55 +243,99 @@ class Database:
         verdict: Verdict,
         trigger: str,
         rules_version: str,
-        report_count: int = 0,
         action: str | None = None,
+        notify: bool | None = None,
     ) -> int:
+        """Insert a case. For reports, report_count is computed inside the INSERT,
+        so concurrent reports get distinct counts. `notify` defaults to verdict.post."""
+        wants_post = verdict.post if notify is None else notify
         cur = await self.conn.execute(
-            "INSERT INTO cases(message_id, channel_id, author_id, content_hash, content, source, "
-            "model_version, rules_version, trigger, report_count, scores_json, decision, rule_id, "
-            "reason, enforced, action, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO cases(message_id, channel_id, author_id, content_hash, content, source, model_version, "
+            "rules_version, trigger, report_count, scores_json, decision, rule_id, reason, enforced, action, "
+            "notify, ping, created_at) VALUES (?,?,?,?,?,?,?,?,?, "
+            "CASE WHEN ? = 'report' THEN (SELECT COUNT(*) + 1 FROM cases "
+            "WHERE message_id = ? AND content_hash = ? AND trigger = 'report') ELSE 0 END, "
+            "?,?,?,?,?,?,?,?,?)",
             (
                 inp.message_id, inp.channel_id, inp.author_id, inp.hash,
                 None if verdict.redact else inp.content,
                 result.source if result else None,
                 result.model_version if result else None,
-                rules_version, trigger, report_count,
+                rules_version, trigger,
+                trigger, inp.message_id, inp.hash,
                 json.dumps({"scores": result.scores, "flagged": result.flagged}) if result else None,
                 verdict.decision.value, verdict.rule_id, verdict.reason,
-                int(verdict.enforced and verdict.decision is Decision.DELETE), action, now(),
+                int(verdict.enforced and verdict.decision is Decision.DELETE),
+                action,
+                "pending" if wants_post else None,
+                int(verdict.ping),
+                now(),
             ),
         )
         await self.conn.commit()
         return cur.lastrowid
 
+    async def get_case(self, case_id: int) -> aiosqlite.Row | None:
+        async with self.conn.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)) as cur:
+            return await cur.fetchone()
+
+    async def has_case(self, message_id: int, chash: str) -> bool:
+        async with self.conn.execute(
+            "SELECT 1 FROM cases WHERE message_id = ? AND content_hash = ? LIMIT 1", (message_id, chash)
+        ) as cur:
+            return await cur.fetchone() is not None
+
     async def finish_action(self, case_id: int, action: str, verdict: Verdict | None = None) -> None:
-        """Resolve a pending enforced delete. done = deleted; anything else = not enforced."""
-        if action in ("done", "gone_unconfirmed"):
-            # gone_unconfirmed: recovery found the message missing but can't prove ModBot deleted it
-            await self.conn.execute("UPDATE cases SET action = ? WHERE case_id = ?", (action, case_id))
-        elif verdict is not None:
-            await self.conn.execute(
-                "UPDATE cases SET action = ?, enforced = 0, decision = ?, reason = ? WHERE case_id = ?",
-                (action, verdict.decision.value, verdict.reason, case_id),
-            )
+        """Resolve a pending enforced delete.
+
+        done              ModBot's DELETE succeeded.
+        gone / failed     Not enforced; `verdict` carries the new decision and reason.
+        gone_unconfirmed  Found missing after a crash: gone, but not provably by ModBot.
+        superseded        Still present after a crash; re-checked as a new case, so no post for this one.
+        """
+        if action == "done":
+            sql, args = "UPDATE cases SET action = 'done' WHERE case_id = ?", (case_id,)
+        elif action == "gone_unconfirmed":
+            sql, args = "UPDATE cases SET action = ?, enforced = 0 WHERE case_id = ?", (action, case_id)
+        elif action == "superseded":
+            sql = ("UPDATE cases SET action = ?, enforced = 0, notify = NULL, "
+                   "reason = reason || '; restarted before delete, re-checked' WHERE case_id = ?")
+            args = (action, case_id)
+        elif action in ("gone", "failed"):
+            if verdict is None:
+                raise ValueError(f"finish_action({action!r}) needs the updated verdict")
+            sql = "UPDATE cases SET action = ?, enforced = 0, decision = ?, reason = ? WHERE case_id = ?"
+            args = (action, verdict.decision.value, verdict.reason, case_id)
         else:
-            await self.conn.execute(
-                "UPDATE cases SET action = ?, enforced = 0, reason = reason || '; delete not confirmed, kept' "
-                "WHERE case_id = ?", (action, case_id),
-            )
+            raise ValueError(f"unknown action {action!r}")
+        await self.conn.execute(sql, args)
         await self.conn.commit()
 
-    async def pending_actions(self) -> list[tuple[int, int, int]]:
+    async def pending_actions(self) -> list[aiosqlite.Row]:
         async with self.conn.execute(
-            "SELECT case_id, channel_id, message_id FROM cases WHERE action = 'pending'"
+            "SELECT case_id, channel_id, message_id, trigger FROM cases WHERE action = 'pending'"
         ) as cur:
-            return [(r["case_id"], r["channel_id"], r["message_id"]) async for r in cur]
+            return list(await cur.fetchall())
 
     async def already_deleted(self, message_id: int) -> bool:
         async with self.conn.execute(
-            "SELECT 1 FROM cases WHERE message_id = ? AND action IN ('done', 'gone_unconfirmed') LIMIT 1", (message_id,)
+            "SELECT 1 FROM cases WHERE message_id = ? AND action IN ('done', 'gone_unconfirmed') LIMIT 1",
+            (message_id,),
         ) as cur:
             return await cur.fetchone() is not None
+
+    async def set_notified(self, case_id: int) -> None:
+        await self.conn.execute("UPDATE cases SET notify = 'sent' WHERE case_id = ?", (case_id,))
+        await self.conn.commit()
+
+    async def pending_notifications(self, older_than: int, newer_than: int, limit: int) -> list[int]:
+        """Posts the inline path didn't confirm. Skips cases whose delete is still in flight."""
+        async with self.conn.execute(
+            "SELECT case_id FROM cases WHERE notify = 'pending' AND (action IS NULL OR action != 'pending') "
+            "AND created_at <= ? AND created_at >= ? ORDER BY case_id LIMIT ?",
+            (older_than, newer_than, limit),
+        ) as cur:
+            return [r["case_id"] async for r in cur]
 
     async def set_mod_outcome(self, case_id: int, outcome: str) -> bool:
         cur = await self.conn.execute("UPDATE cases SET mod_outcome = ? WHERE case_id = ?", (outcome, case_id))
@@ -301,9 +343,10 @@ class Database:
         return cur.rowcount > 0
 
     async def flagged_deletions(self, author_id: int, rule_id: str, since: int) -> int:
+        """Confirmed ModBot deletions only (not would-deletes, log rows, or unconfirmed recoveries)."""
         async with self.conn.execute(
-            "SELECT COUNT(*) AS n FROM cases WHERE author_id = ? AND rule_id = ? AND decision = 'DELETE' "
-            "AND enforced = 1 AND action = 'done' AND created_at >= ?",
+            "SELECT COUNT(*) AS n FROM cases WHERE author_id = ? AND rule_id = ? AND action = 'done' "
+            "AND created_at >= ?",
             (author_id, rule_id, since),
         ) as cur:
             return (await cur.fetchone())["n"]
@@ -320,30 +363,33 @@ class Database:
     # ---- report cooldowns (reporter stored only as an HMAC) -----------------
 
     async def report_allowed(self, reporter_hash: str, min_gap: int = 30, per_hour: int = 10) -> bool:
-        t = now()
-        async with self.conn.execute(
-            "SELECT last_report, window_start, count_window FROM report_cooldowns WHERE reporter_hash = ?",
-            (reporter_hash,),
-        ) as cur:
-            row = await cur.fetchone()
-        if row:
-            if t - row["last_report"] < min_gap:
-                return False
-            window_start, count = row["window_start"], row["count_window"]
-            if t - window_start >= 3600:
+        # Read-check-write must be atomic: without the lock, concurrent reports from
+        # one member all read the old state and all pass.
+        async with self._cooldown_lock:
+            t = now()
+            async with self.conn.execute(
+                "SELECT last_report, window_start, count_window FROM report_cooldowns WHERE reporter_hash = ?",
+                (reporter_hash,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                if t - row["last_report"] < min_gap:
+                    return False
+                window_start, count = row["window_start"], row["count_window"]
+                if t - window_start >= 3600:
+                    window_start, count = t, 0
+                if count >= per_hour:
+                    return False
+            else:
                 window_start, count = t, 0
-            if count >= per_hour:
-                return False
-        else:
-            window_start, count = t, 0
-        await self.conn.execute(
-            "INSERT INTO report_cooldowns VALUES (?, ?, ?, ?) ON CONFLICT(reporter_hash) DO UPDATE SET "
-            "last_report = excluded.last_report, window_start = excluded.window_start, "
-            "count_window = excluded.count_window",
-            (reporter_hash, t, window_start, count + 1),
-        )
-        await self.conn.commit()
-        return True
+            await self.conn.execute(
+                "INSERT INTO report_cooldowns VALUES (?, ?, ?, ?) ON CONFLICT(reporter_hash) DO UPDATE SET "
+                "last_report = excluded.last_report, window_start = excluded.window_start, "
+                "count_window = excluded.count_window",
+                (reporter_hash, t, window_start, count + 1),
+            )
+            await self.conn.commit()
+            return True
 
     # ---- retention ----------------------------------------------------------
 

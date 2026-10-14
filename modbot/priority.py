@@ -12,7 +12,7 @@ import re
 
 _AGE = re.compile(
     r"\b(kids?|child(ren)?|minors?|underage|under[- ]?age|preteens?|teens?|"
-    r"little (girl|boy)s?|school ?(girl|boy)s?|\d{1,2}\s?(yo|y/o|year[- ]?olds?))\b",
+    r"little (girl|boy)s?|school ?(girl|boy)s?|\d{1,2}\s?(yo|y/o|years?[- ]?olds?))\b",
     re.IGNORECASE,
 )
 _SEXUAL = re.compile(
