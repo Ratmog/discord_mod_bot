@@ -1,0 +1,16 @@
+[Unit]
+Description=ModBot Discord moderation bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=modbot
+WorkingDirectory=/opt/modbot
+EnvironmentFile=/opt/modbot/.env
+ExecStart=/opt/modbot/venv/bin/python -m modbot
+Restart=always
+RestartSec=5
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

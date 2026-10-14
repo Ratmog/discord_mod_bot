@@ -1,0 +1,38 @@
+# ModBot rules. Read-only defaults: thresholds live here (and change
+# rules_version); per-rule enforce state is seeded into the database the
+# first time a rule id is seen, and after that only `/modbot enforce`
+# changes it.
+#
+# Thresholds are per rule AND per trigger ("auto" = every message,
+# "report" = a member reported it). All values are illustrative starting
+# points until the auto dry-run (gate G3) calibrates them.
+#
+# Only categories listed here can ever cause a deletion. A report lowers the
+# evidence needed for a prohibited category; it never makes generic
+# offensiveness prohibited.
+#
+# Rules are evaluated top to bottom; the first one that matches wins.
+
+- id: CHILD_SAFETY
+  categories: [sexual/minors]
+  delete_if_flagged: true        # OpenAI's own flag deletes on any trigger
+  delete_at: {auto: 0.70, report: 0.50}
+  log_at: 0.10                   # 0.10 up to a delete: posted to #mod-logs, no ping
+  ignores_dry_run: true          # live from day one, by policy
+  ignores_context: true          # quotation/humor context never suppresses this rule
+  redact: true                   # message text never stored or posted
+  ping: true                     # deletions ping the moderator role
+  default_enforce: true
+
+- id: HATE_THREAT
+  categories: [hate/threatening]
+  delete_at: {auto: 0.85, report: 0.65}
+  escalate_at: 0.50
+  default_enforce: false
+
+- id: VIOLENCE_THREAT
+  categories: [violence, harassment/threatening]
+  delete_at: {auto: 0.80, report: 0.60}
+  escalate_at: 0.60
+  default_enforce: false
+  suppress_if: {}                # Phase 2: e.g. {QUOTATION: 0.7, SELF_DIRECTED: 0.8}
