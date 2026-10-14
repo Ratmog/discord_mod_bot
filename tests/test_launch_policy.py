@@ -6,6 +6,7 @@ from modbot.cogs.auto import Auto
 from modbot.models import Decision, ModerationInput, ModerationResult, Trigger
 from modbot.moderation.pipeline import Pipeline, seed_rule_settings
 from modbot.moderation.rules import RuleSet, StaticFlags, evaluate
+
 from .conftest import FakeClassifier, FakeGateway
 
 
