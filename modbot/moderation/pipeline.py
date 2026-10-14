@@ -327,7 +327,7 @@ class Pipeline:
 
     async def _notify(self, case_id: int) -> bool:
         row = await self.db.get_case(case_id)
-        if row is None:
+        if row is None or row["notify"] != "pending":
             return False
         ok = await self.gw.post_modlog(await self._build_post(row))
         if ok:

@@ -11,17 +11,18 @@
 # evidence needed for a prohibited category; it never makes generic
 # offensiveness prohibited.
 #
-# Rules are evaluated top to bottom; the first one that matches wins.
+# All matching rules are evaluated; the strongest outcome wins.
 
 - id: CHILD_SAFETY
   categories: [sexual/minors]
   delete_if_flagged: true        # OpenAI's own flag deletes on any trigger
-  delete_at: {auto: 0.70, report: 0.50}
+  # Initially delete on the classifier's category flag only. Numeric scores
+  # below its own flag are logged for calibration, never automatic deletion.
   log_at: 0.10                   # 0.10 up to a delete: posted to #mod-logs, no ping
   ignores_dry_run: true          # live from day one, by policy
   ignores_context: true          # quotation/humor context never suppresses this rule
   redact: true                   # message text never stored or posted
-  ping: true                     # deletions ping the moderator role
+  ping: true                     # flagged deletions ping the moderator role
   default_enforce: true
 
 - id: HATE_THREAT

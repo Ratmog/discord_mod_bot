@@ -22,6 +22,7 @@ class Config:
     openai_api_key: str
     guild_id: int
     modlog_channel_id: int
+    exempt_channel_ids: frozenset[int]
     mod_role_id: int | None
     game_bot_ids: frozenset[int]
     game_channel_ids: frozenset[int]
@@ -49,13 +50,15 @@ class Config:
             openai_api_key=os.environ["OPENAI_API_KEY"].strip(),
             guild_id=int(os.environ["GUILD_ID"]),
             modlog_channel_id=int(os.environ["MODLOG_CHANNEL_ID"]),
+            exempt_channel_ids=_ids(os.getenv("EXEMPT_CHANNEL_IDS", ""))
+            | {int(os.environ["MODLOG_CHANNEL_ID"])},
             mod_role_id=int(role) if role else None,
             game_bot_ids=_ids(os.environ["GAME_BOT_IDS"]),
             game_channel_ids=_ids(os.getenv("GAME_CHANNEL_IDS", "")),
             cleanup_include_commands=_bool(os.getenv("CLEANUP_INCLUDE_COMMANDS", "false")),
             reporter_hmac_secret=os.environ["REPORTER_HMAC_SECRET"].encode(),
             dry_run_default=_bool(os.getenv("DRY_RUN", "true")),
-            openai_rpm=int(os.getenv("OPENAI_RPM", "300")),
+            openai_rpm=int(os.getenv("OPENAI_RPM", "200")),
             db_path=os.getenv("DB_PATH", "modbot.db"),
             rules_path=os.getenv("RULES_PATH", "rules.yaml"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),

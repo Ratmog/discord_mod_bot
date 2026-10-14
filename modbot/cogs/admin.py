@@ -11,6 +11,7 @@ from discord.ext import commands
 
 from modbot.cogs._util import to_input
 from modbot.db import now
+from modbot.gateway import ModlogPost
 from modbot.links import parse_message_link
 from modbot.models import Trigger
 from modbot.moderation.pipeline import user_facing
@@ -37,11 +38,21 @@ class ModbotGroup(app_commands.Group, name="modbot", description="ModBot adminis
             return False
         return True
 
+    async def _update_setting(self, interaction: discord.Interaction, key: str, value: str) -> None:
+        old, changed = await self.bot.db.set_setting_audited(key, value, interaction.user.id)
+        if changed:
+            await self.bot.gateway.post_modlog(ModlogPost(
+                "ModBot configuration changed", 0x5B8DEF,
+                [("Administrator", f"<@{interaction.user.id}> (`{interaction.user.id}`)"),
+                 ("Setting", f"`{key}`"),
+                 ("Changed", f"`{old if old is not None else '(unset)'}` → `{value}`")],
+            ))
+
     @app_commands.command(name="dryrun", description="Global dry-run override (child safety ignores it)")
     @app_commands.choices(state=[app_commands.Choice(name="on", value="on"),
                                  app_commands.Choice(name="off", value="off")])
     async def dryrun(self, interaction: discord.Interaction, state: app_commands.Choice[str]) -> None:
-        await self.bot.db.set_setting("dry_run", "true" if state.value == "on" else "false")
+        await self._update_setting(interaction, "dry_run", "true" if state.value == "on" else "false")
         await interaction.response.send_message(f"Dry-run is now **{state.value}**.", ephemeral=True)
 
     @app_commands.command(name="enforce", description="Turn deletion on or off for one rule")
@@ -52,7 +63,7 @@ class ModbotGroup(app_commands.Group, name="modbot", description="ModBot adminis
             ids = ", ".join(r.id for r in self.bot.rules.rules)
             await interaction.response.send_message(f"Unknown rule. Rules: {ids}", ephemeral=True)
             return
-        await self.bot.db.set_setting(f"enforce:{rule}", "true" if state.value == "on" else "false")
+        await self._update_setting(interaction, f"enforce:{rule}", "true" if state.value == "on" else "false")
         await interaction.response.send_message(f"`{rule}` enforcement is now **{state.value}**.", ephemeral=True)
 
     @enforce.autocomplete("rule")

@@ -125,11 +125,11 @@ def _evaluate_rule(rule: Rule, result: ModerationResult, flags: Flags, key: str)
     )
     if cutoff is not None and score >= cutoff and not suppressed:
         return verdict(Decision.DELETE, f"{cat}={score:.2f} >= {key} cutoff {cutoff}", live, rule.ping)
-    if rule.log_at is not None and score >= rule.log_at:
-        return verdict(Decision.ESCALATE, f"{cat}={score:.2f} (log tier)", False, False)
     if rule.escalate_at is not None and score >= rule.escalate_at:
         reason = f"{cat}={score:.2f}" + (" (context suppressed deletion)" if suppressed else "")
         return verdict(Decision.ESCALATE, reason, False, False)
+    if rule.log_at is not None and score >= rule.log_at:
+        return verdict(Decision.ESCALATE, f"{cat}={score:.2f} (log tier)", False, False)
     return None
 
 

@@ -67,9 +67,15 @@ def test_violent_content_alone_never_deletes(rules, trigger):
     assert v.decision is Decision.ESCALATE and v.rule_id == "VIOLENT_CONTENT"
 
 
-def test_priority_order_first_match_wins(rules):
+def test_unflagged_child_safety_only_logs(rules):
+    for trigger in (Trigger.AUTO, Trigger.REPORT):
+        v = evaluate(rules, res({"sexual/minors": 0.99}), ALL_ON, trigger)
+        assert v.decision is Decision.ESCALATE and not v.enforced and v.redact
+
+
+def test_unflagged_child_safety_does_not_mask_live_threat(rules):
     v = evaluate(rules, res({"sexual/minors": 0.8, "hate/threatening": 0.9}), ALL_ON, Trigger.AUTO)
-    assert v.rule_id == "CHILD_SAFETY"
+    assert v.rule_id == "HATE_THREAT" and v.decision is Decision.DELETE and v.redact
 
 
 def test_child_safety_flag_deletes_and_pings_and_redacts(rules):
