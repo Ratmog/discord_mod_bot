@@ -117,3 +117,45 @@ async def test_settings_seed_once(db, rules):
     await seed_rule_settings(db, rules, dry_run_default=False)  # restart with different defaults
     assert db.setting("enforce:HATE_THREAT") == "true"
     assert db.setting("dry_run") == "true"
+
+
+async def test_five_concurrent_enforced_reports_delete_once(db, rules):
+    p, clf, gw = await make(db, rules, {"bad": {"hate/threatening": 0.95}}, dry_run=False)
+    await db.set_setting("enforce:HATE_THREAT", "true")
+    clf.delay = 0.02
+    m = msg(9, "bad", author=55)
+    gw.add(m)
+    outs = await asyncio.gather(*(p.run(m, Trigger.REPORT) for _ in range(5)))
+    assert gw.delete_attempts == [9] and gw.deleted == [9]  # exactly one Discord call
+    assert sum(o.deleted for o in outs) == 1
+    assert gw.dms == [55] and len(gw.posts) == 1  # one DM, one mod-log post
+    async with db.conn.execute(
+        "SELECT action, enforced FROM cases WHERE message_id = 9 ORDER BY case_id"
+    ) as cur:
+        rows = [(r["action"], r["enforced"]) async for r in cur]
+    assert rows[0] == ("done", 1)
+    assert all(enforced == 0 for _, enforced in rows[1:])  # followers record, don't claim the action
+    assert p._locks == {}  # no lock leak
+
+
+async def test_audit_row_written_before_delete_and_reconciled(db, rules):
+    p, clf, gw = await make(db, rules, {"bad": {"hate/threatening": 0.95}}, dry_run=False)
+    await db.set_setting("enforce:HATE_THREAT", "true")
+    m = msg(11, "bad")
+    gw.add(m)
+    seen = {}
+
+    async def crash_mid_delete(channel_id, message_id):
+        seen["pending"] = await db.pending_actions()
+        gw.messages.pop(message_id)  # Discord deleted it...
+        raise asyncio.CancelledError  # ...then the process died before we recorded it
+
+    gw.delete_message = crash_mid_delete
+    try:
+        await p.run(m, Trigger.REPORT)
+    except asyncio.CancelledError:
+        pass
+    assert len(seen["pending"]) == 1  # record existed before the delete call
+    assert len(await db.pending_actions()) == 1
+    assert await p.reconcile() == 1  # restart: message is gone, so the delete went through
+    assert await db.pending_actions() == [] and await db.already_deleted(11)

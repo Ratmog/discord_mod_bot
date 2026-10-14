@@ -55,8 +55,10 @@ CREATE TABLE IF NOT EXISTS cases (
     reason         TEXT,
     enforced       INTEGER NOT NULL,     -- 0 = would-have-acted
     mod_outcome    TEXT,                 -- optional: violation | fine
+    action         TEXT,                 -- enforced delete: pending | done | gone | failed
     created_at     INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_cases_action ON cases(action) WHERE action = 'pending';
 CREATE INDEX IF NOT EXISTS idx_cases_msg ON cases(message_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cases_calib ON cases(rule_id, decision, enforced);
 CREATE INDEX IF NOT EXISTS idx_cases_author ON cases(author_id, rule_id, created_at);
@@ -223,11 +225,12 @@ class Database:
         trigger: str,
         rules_version: str,
         report_count: int = 0,
+        action: str | None = None,
     ) -> int:
         cur = await self.conn.execute(
             "INSERT INTO cases(message_id, channel_id, author_id, content_hash, content, source, "
             "model_version, rules_version, trigger, report_count, scores_json, decision, rule_id, "
-            "reason, enforced, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "reason, enforced, action, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 inp.message_id, inp.channel_id, inp.author_id, inp.hash,
                 None if verdict.redact else inp.content,
@@ -236,11 +239,39 @@ class Database:
                 rules_version, trigger, report_count,
                 json.dumps({"scores": result.scores, "flagged": result.flagged}) if result else None,
                 verdict.decision.value, verdict.rule_id, verdict.reason,
-                int(verdict.enforced and verdict.decision is Decision.DELETE), now(),
+                int(verdict.enforced and verdict.decision is Decision.DELETE), action, now(),
             ),
         )
         await self.conn.commit()
         return cur.lastrowid
+
+    async def finish_action(self, case_id: int, action: str, verdict: Verdict | None = None) -> None:
+        """Resolve a pending enforced delete. done = deleted; anything else = not enforced."""
+        if action == "done":
+            await self.conn.execute("UPDATE cases SET action = 'done' WHERE case_id = ?", (case_id,))
+        elif verdict is not None:
+            await self.conn.execute(
+                "UPDATE cases SET action = ?, enforced = 0, decision = ?, reason = ? WHERE case_id = ?",
+                (action, verdict.decision.value, verdict.reason, case_id),
+            )
+        else:
+            await self.conn.execute(
+                "UPDATE cases SET action = ?, enforced = 0, reason = reason || '; delete not confirmed, kept' "
+                "WHERE case_id = ?", (action, case_id),
+            )
+        await self.conn.commit()
+
+    async def pending_actions(self) -> list[tuple[int, int, int]]:
+        async with self.conn.execute(
+            "SELECT case_id, channel_id, message_id FROM cases WHERE action = 'pending'"
+        ) as cur:
+            return [(r["case_id"], r["channel_id"], r["message_id"]) async for r in cur]
+
+    async def already_deleted(self, message_id: int) -> bool:
+        async with self.conn.execute(
+            "SELECT 1 FROM cases WHERE message_id = ? AND action = 'done' LIMIT 1", (message_id,)
+        ) as cur:
+            return await cur.fetchone() is not None
 
     async def set_mod_outcome(self, case_id: int, outcome: str) -> bool:
         cur = await self.conn.execute("UPDATE cases SET mod_outcome = ? WHERE case_id = ?", (outcome, case_id))

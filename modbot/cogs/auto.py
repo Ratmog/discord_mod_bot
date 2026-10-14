@@ -15,7 +15,7 @@ import discord
 from discord.ext import commands
 
 from modbot.autoqueue import AutoQueue
-from modbot.cogs._util import is_game_command, to_input
+from modbot.cogs._util import to_input
 from modbot.models import ModerationInput, Trigger
 from modbot.priority import is_high_priority
 
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 WORKERS = 2
+LINGER = 0.5  # seconds to wait for more messages so bursts go out as one batch
 
 
 class Auto(commands.Cog):
@@ -32,6 +33,7 @@ class Auto(commands.Cog):
         self.queue: AutoQueue[ModerationInput] = AutoQueue(maxsize=500)
         self._workers: list[asyncio.Task] = []
         self._last_dropped = 0
+        self._last_dropped_high = 0
 
     async def cog_load(self) -> None:
         self._workers = [asyncio.create_task(self._worker(i)) for i in range(WORKERS)]
@@ -48,7 +50,8 @@ class Auto(commands.Cog):
             and not msg.author.bot
             and not msg.webhook_id
             and bool(msg.content.strip())
-            and not is_game_command(msg, cfg.game_bot_ids)
+            # Messages that mention or reply to a game bot are still scored: exempting
+            # them would let anyone bypass moderation by @-ing Pokétwo.
         )
 
     def _enqueue(self, msg: discord.Message) -> None:
@@ -56,6 +59,10 @@ class Auto(commands.Cog):
         if self.queue.dropped != self._last_dropped:
             log.warning("auto queue overflow: %d normal-priority messages dropped so far", self.queue.dropped)
             self._last_dropped = self.queue.dropped
+        if self.queue.dropped_high != self._last_dropped_high:
+            log.error("auto queue hard cap hit: %d HIGH-priority messages dropped; is OpenAI down?",
+                      self.queue.dropped_high)
+            self._last_dropped_high = self.queue.dropped_high
 
     @commands.Cog.listener()
     async def on_message(self, msg: discord.Message) -> None:
@@ -87,7 +94,9 @@ class Auto(commands.Cog):
         clf = self.bot.pipeline.classifier
         while True:
             try:
-                batch = await self.queue.take(clf.max_batch)
+                batch = await self.queue.take(clf.max_batch, linger=LINGER)
+                if not batch:  # the other worker took everything during the linger
+                    continue
                 await self.bot.pipeline.run_many(batch, Trigger.AUTO)
             except asyncio.CancelledError:
                 raise

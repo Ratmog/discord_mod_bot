@@ -1,7 +1,12 @@
 """Delete Pokétwo/Lawliet messages 5-6 minutes after they post.
 
-Enqueue on arrival, sweep every 60 s. The first sweep after start also scans
-recent history for game messages posted while the bot was offline.
+Enqueue on arrival, sweep every 60 s. History catch-up covers messages the bot
+never saw: on the first sweep after start, and after any reconnect that needed
+a fresh IDENTIFY (a RESUME replays missed events, so it needs nothing).
+
+The catch-up checkpoint is `gateway_down_since`, written when the gateway
+disconnects, not the sweeper heartbeat: the sweeper can keep running while the
+gateway is down, so its heartbeat says nothing about what was observed.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ CATCHUP_WINDOW = 2 * 3600
 class Cleanup(commands.Cog):
     def __init__(self, bot: ModBot):
         self.bot = bot
+        self._seen_ready = False
 
     async def cog_load(self) -> None:
         self.sweeper.start()
@@ -62,10 +68,38 @@ class Cleanup(commands.Cog):
         return [c for c in candidates
                 if c.permissions_for(me).read_message_history and c.permissions_for(me).manage_messages]
 
+    @commands.Cog.listener()
+    async def on_disconnect(self) -> None:
+        if self.bot.db.setting("gateway_down_since") in (None, ""):
+            await self.bot.db.set_setting("gateway_down_since", str(now()))
+
+    @commands.Cog.listener()
+    async def on_resumed(self) -> None:
+        # RESUME replays everything missed, so there's nothing to catch up.
+        await self.bot.db.set_setting("gateway_down_since", "")
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        # Fires on every IDENTIFY. The first one is handled by the sweeper's first
+        # loop; later ones mean events were lost, so catch up from the disconnect.
+        if not self._seen_ready:
+            self._seen_ready = True
+            return
+        await self.catch_up()
+
+    def _catchup_since(self) -> int:
+        db = self.bot.db
+        down = db.setting("gateway_down_since")
+        candidates = [int(down)] if down else []
+        hb = db.last_heartbeat()
+        if hb:
+            candidates.append(hb)  # process restart: we saw nothing after the last sweep
+        start = min(candidates) if candidates else 0
+        return max(start, now() - CATCHUP_WINDOW) - 60
+
     async def catch_up(self) -> None:
-        """Game messages posted while offline: bounded window, paginated to the end (INSERT OR IGNORE)."""
-        last = self.bot.db.last_heartbeat() or 0
-        since = max(last, now() - CATCHUP_WINDOW) - 60
+        """Game messages the bot never saw: bounded window, paginated to the end (INSERT OR IGNORE)."""
+        since = self._catchup_since()
         after = dt.datetime.fromtimestamp(since, dt.UTC)
         found = 0
         for ch in self._channels():
@@ -76,6 +110,7 @@ class Cleanup(commands.Cog):
                         found += 1
             except discord.HTTPException:
                 log.warning("catch-up failed for channel %s", ch.id, exc_info=True)
+        await self.bot.db.set_setting("gateway_down_since", "")
         log.info("cleanup catch-up queued %d message(s)", found)
 
     @tasks.loop(seconds=60)

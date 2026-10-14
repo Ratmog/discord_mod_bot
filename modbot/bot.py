@@ -55,6 +55,9 @@ class ModBot(commands.Bot):
         if self._checked_perms:
             return
         self._checked_perms = True
+        fixed = await self.pipeline.reconcile()  # deletions a crash left half-recorded
+        if fixed:
+            log.info("reconciled %d pending deletion(s)", fixed)
         guild = self.get_guild(self.config.guild_id)
         if guild is None:
             log.error("bot is not in guild %s", self.config.guild_id)

@@ -37,3 +37,34 @@ async def test_queue_drops_oldest_normal_never_high():
     q.put("h2", high=True)  # n2 dropped
     assert q.dropped == 2
     assert await q.take(10) == ["h1", "h2", "n3"]
+
+
+async def test_queue_hard_bounded_even_when_all_high():
+    q = AutoQueue(maxsize=10, high_max=10)
+    for i in range(1000):
+        q.put(i, high=True)
+    assert len(q) == 10 and q.dropped_high == 990
+    assert await q.take(20) == list(range(990, 1000))
+
+
+async def test_take_lingers_to_fill_a_batch():
+    import asyncio
+
+    q = AutoQueue()
+    q.put("a")
+
+    async def trickle():
+        for x in "bcd":
+            await asyncio.sleep(0.01)
+            q.put(x)
+
+    task = asyncio.create_task(trickle())
+    batch = await q.take(20, linger=0.2)
+    await task
+    assert batch == ["a", "b", "c", "d"]
+
+
+async def test_take_without_linger_returns_immediately():
+    q = AutoQueue()
+    q.put("a")
+    assert await q.take(20) == ["a"]

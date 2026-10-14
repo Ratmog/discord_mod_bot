@@ -30,9 +30,21 @@
   escalate_at: 0.50
   default_enforce: false
 
-- id: VIOLENCE_THREAT
-  categories: [violence, harassment/threatening]
+- id: THREAT
+  # Directed threats only. General violent content (fiction, news, game talk)
+  # is a separate signal below and never shares a max() with this rule.
+  categories: [harassment/threatening]
   delete_at: {auto: 0.80, report: 0.60}
   escalate_at: 0.60
   default_enforce: false
   suppress_if: {}                # Phase 2: e.g. {QUOTATION: 0.7, SELF_DIRECTED: 0.8}
+
+- id: VIOLENT_CONTENT
+  # Violent description is not a violation by itself on this server.
+  # Flag-and-keep only: no delete_at, so it can never delete.
+  categories: [violence]
+  escalate_at: 0.90
+  default_enforce: false
+
+# SEXUAL_THREAT and GROUP_VIOLENCE have no OpenAI category; they arrive with
+# the Phase 2 local model, with thresholds measured on that model's scores.

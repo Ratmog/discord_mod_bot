@@ -75,6 +75,7 @@ class Pipeline:
         self.guild_id = guild_id
         self.flags = flags or SettingsFlags(db)
         self._inflight: dict[tuple, asyncio.Future] = {}
+        self._locks: dict[int, asyncio.Lock] = {}
 
     # ---- public -------------------------------------------------------------
 
@@ -151,38 +152,90 @@ class Pipeline:
             return Outcome(verdict, case_id)
 
         verdict = evaluate(rules, result, self.flags, trigger)
+        if not (verdict.decision is Decision.DELETE and verdict.enforced):
+            case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
+            return await self._report(inp, verdict, trigger, case_id, False, False, report_count)
+
+        # Enforced delete. One action per message at a time: concurrent reports and
+        # the auto path queue here, and later ones see the message already gone.
+        lock = self._locks.setdefault(inp.message_id, asyncio.Lock())
+        try:
+            async with lock:
+                return await self._enforce(inp, result, verdict, trigger, report_count, retried)
+        finally:
+            if not lock.locked() and self._locks.get(inp.message_id) is lock:
+                del self._locks[inp.message_id]
+
+    async def _enforce(
+        self, inp: ModerationInput, result: ModerationResult, verdict: Verdict, trigger: Trigger,
+        report_count: int, retried: bool,
+    ) -> Outcome:
+        rules = self.rules
+        if await self.db.already_deleted(inp.message_id):
+            verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already removed by ModBot")
+            case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
+            return Outcome(verdict, case_id, gone=True)  # no second post, DM, or Discord call
+
+        try:
+            current = await self.gw.fetch_message(inp.channel_id, inp.message_id)
+        except GoneError:
+            verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already gone")
+            case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
+            return await self._report(inp, verdict, trigger, case_id, False, True, report_count)
+        except TransientError:
+            verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
+                              reason=verdict.reason + "; re-fetch failed, kept")
+            case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
+            return await self._report(inp, verdict, trigger, case_id, False, False, report_count)
+
+        if content_hash(current.content) != inp.hash:
+            if not retried:  # edited since scoring: judge the new text once
+                new_inp = replace(inp, content=current.content)
+                new_res = (await self._scores([new_inp]))[0]
+                return await self._finish(new_inp, new_res, trigger, retried=True)
+            verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
+                              reason=verdict.reason + "; message keeps changing, kept")
+            case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
+            return await self._report(inp, verdict, trigger, case_id, False, False, report_count)
+
+        # Write the audit record BEFORE deleting, so a crash in between leaves a
+        # pending action that reconcile() resolves on restart.
+        case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count,
+                                            action="pending")
         deleted = gone = False
+        try:
+            await self.gw.delete_message(inp.channel_id, inp.message_id)
+            deleted = True
+            await self.db.finish_action(case_id, "done")
+        except GoneError:
+            gone = True
+            verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already gone")
+            await self.db.finish_action(case_id, "gone", verdict)
+        except TransientError:
+            verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
+                              reason=verdict.reason + "; delete failed, kept")
+            await self.db.finish_action(case_id, "failed", verdict)
+        return await self._report(inp, verdict, trigger, case_id, deleted, gone, report_count)
 
-        if verdict.decision is Decision.DELETE and verdict.enforced:
+    async def reconcile(self) -> int:
+        """Resolve deletions left 'pending' by a crash. Returns how many were fixed."""
+        fixed = 0
+        for case_id, channel_id, message_id in await self.db.pending_actions():
             try:
-                current = await self.gw.fetch_message(inp.channel_id, inp.message_id)
+                await self.gw.fetch_message(channel_id, message_id)
             except GoneError:
-                gone = True
+                await self.db.finish_action(case_id, "done")  # the delete went through
             except TransientError:
-                verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
-                                  reason=verdict.reason + "; re-fetch failed, kept")
+                continue  # try again next start
             else:
-                if content_hash(current.content) != inp.hash:
-                    if not retried:  # edited since scoring: judge the new text once
-                        new_inp = replace(inp, content=current.content)
-                        new_res = (await self._scores([new_inp]))[0]
-                        return await self._finish(new_inp, new_res, trigger, retried=True)
-                    verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
-                                      reason=verdict.reason + "; message keeps changing, kept")
-                else:
-                    try:
-                        await self.gw.delete_message(inp.channel_id, inp.message_id)
-                        deleted = True
-                    except GoneError:
-                        gone = True
-                    except TransientError:
-                        verdict = replace(verdict, decision=Decision.ERROR, enforced=False,
-                                          reason=verdict.reason + "; delete failed, kept")
-            if gone:
-                verdict = replace(verdict, enforced=False, reason=verdict.reason + "; already gone")
+                await self.db.finish_action(case_id, "failed", None)  # still there: kept
+            fixed += 1
+        return fixed
 
-        case_id = await self.db.append_case(inp, result, verdict, trigger.value, rules.version, report_count)
-
+    async def _report(
+        self, inp: ModerationInput, verdict: Verdict, trigger: Trigger, case_id: int,
+        deleted: bool, gone: bool, report_count: int,
+    ) -> Outcome:
         if verdict.post:
             await self.gw.post_modlog(await self._modlog_post(inp, verdict, trigger, case_id, deleted, report_count))
         if deleted:

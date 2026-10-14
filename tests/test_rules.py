@@ -5,7 +5,7 @@ import pytest
 from modbot.models import Decision, ModerationResult, Trigger
 from modbot.moderation.rules import RuleSet, StaticFlags, evaluate
 
-ALL_ON = StaticFlags(dry_run=False, enforced=frozenset({"CHILD_SAFETY", "HATE_THREAT", "VIOLENCE_THREAT"}))
+ALL_ON = StaticFlags(dry_run=False, enforced=frozenset({"CHILD_SAFETY", "HATE_THREAT", "THREAT", "VIOLENT_CONTENT"}))
 
 
 def res(scores=None, flagged=None, context=None):
@@ -13,7 +13,7 @@ def res(scores=None, flagged=None, context=None):
 
 
 def test_shipped_rules_load(rules):
-    assert [r.id for r in rules.rules] == ["CHILD_SAFETY", "HATE_THREAT", "VIOLENCE_THREAT"]
+    assert [r.id for r in rules.rules] == ["CHILD_SAFETY", "HATE_THREAT", "THREAT", "VIOLENT_CONTENT"]
     assert len(rules.version) == 16
 
 
@@ -55,9 +55,16 @@ def test_report_never_deletes_unlisted_category(rules):
     assert v.decision is Decision.KEEP
 
 
-def test_max_over_categories(rules):
+def test_directed_threat_deletes(rules):
     v = evaluate(rules, res({"violence": 0.1, "harassment/threatening": 0.81}), ALL_ON, Trigger.AUTO)
-    assert v.decision is Decision.DELETE and v.rule_id == "VIOLENCE_THREAT"
+    assert v.decision is Decision.DELETE and v.rule_id == "THREAT"
+
+
+@pytest.mark.parametrize("trigger", [Trigger.AUTO, Trigger.REPORT])
+def test_violent_content_alone_never_deletes(rules, trigger):
+    # Fiction / gore with no directed threat: flag at most, even when reported.
+    v = evaluate(rules, res({"violence": 0.98, "harassment/threatening": 0.02}), ALL_ON, trigger)
+    assert v.decision is Decision.ESCALATE and v.rule_id == "VIOLENT_CONTENT"
 
 
 def test_priority_order_first_match_wins(rules):
@@ -93,7 +100,7 @@ def test_enforce_dry_run_matrix(rules, dry_run, cs_on, hate_on):
 
 def test_enabling_one_rule_does_not_enable_another(rules):
     flags = StaticFlags(dry_run=False, enforced=frozenset({"HATE_THREAT"}))
-    v = evaluate(rules, res({"violence": 0.95}), flags, Trigger.AUTO)
+    v = evaluate(rules, res({"harassment/threatening": 0.95}), flags, Trigger.AUTO)
     assert v.decision is Decision.DELETE and not v.enforced
 
 

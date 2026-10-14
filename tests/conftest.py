@@ -44,6 +44,7 @@ class FakeGateway:
     def __init__(self):
         self.messages: dict[int, FetchedMessage] = {}
         self.deleted: list[int] = []
+        self.delete_attempts: list[int] = []
         self.bulk_calls: list[list[int]] = []
         self.dms: list[int] = []
         self.posts: list[ModlogPost] = []
@@ -54,11 +55,14 @@ class FakeGateway:
         self.messages[inp.message_id] = FetchedMessage(inp.message_id, inp.channel_id, inp.author_id, inp.content)
 
     async def fetch_message(self, channel_id, message_id):
+        await asyncio.sleep(0.005)  # yield, like a real network call, so races can interleave
         if message_id not in self.messages:
             raise GoneError("gone")
         return self.messages[message_id]
 
     async def delete_message(self, channel_id, message_id):
+        self.delete_attempts.append(message_id)
+        await asyncio.sleep(0.005)
         if message_id in self.fail_ids:
             raise TransientError("500")
         if message_id in self.gone_ids:
