@@ -3,8 +3,8 @@
 A Discord moderation bot for a server where edgy humor is normal but a few things are not:
 
 - **Private reports.** `/report <message link>` or right-click a message → Apps → **Report to ModBot**. Replies are visible only to the reporter, and reporter identity is never stored (only an HMAC, for the cooldown).
-- **Auto dry-run.** Every human message is scored (including messages sent through proxy bots like PluralKit, which post via webhooks) with OpenAI Moderation (free). Rules start unenforced and only log what they *would* do, so thresholds can be calibrated on real traffic before anything is deleted.
-- **Child safety, live from day one.** `sexual/minors` content is deleted on OpenAI's own flag even in dry-run, the text is never stored, and moderators are pinged.
+- **Auto dry-run.** Human messages outside exempt staff-review channels are scored (including messages sent through proxy bots like PluralKit, which post via webhooks) with OpenAI Moderation (free). Rules start unenforced and only log what they *would* do, so thresholds can be calibrated on real traffic before anything is deleted.
+- **Child safety, live from day one.** `sexual/minors` content is deleted only when OpenAI flags that category, even in dry-run. Elevated but unflagged scores are logged for review instead of deleted; matching content is redacted from records and moderator posts.
 - **Game-bot cleanup.** Pokétwo and Lawliet messages are deleted 5–6 minutes after they post, surviving restarts.
 
 The full design, gates, and Phase 2 (local ML model) plan live in the technical plan doc.
@@ -20,7 +20,7 @@ Only the expensive classifier call is cached; decisions are recomputed for every
 
 - A **report** re-judges an already-scored message with the stricter `report` threshold, no second API call.
 - Turning a rule on with `/modbot enforce` takes effect immediately, even for messages scored earlier.
-- Only categories listed in `rules.yaml` can ever cause a deletion. A report lowers the bar for those; it never makes ordinary offensiveness deletable.
+- Only categories listed in `rules.yaml` can ever cause a deletion. A report lowers thresholds where configured, but child-safety deletion initially requires OpenAI's own category flag.\n- Repeated reports remain separately recorded, but identical report outcomes don't repeatedly post to `#mod-logs`; a changed rule or enforcement outcome does.
 
 ## Setup
 
@@ -65,7 +65,7 @@ Each `#mod-logs` post has **Violation / Fine** buttons. Marking cases is optiona
 
 ## Configuration notes
 
-- `CLEANUP_INCLUDE_COMMANDS=true` also deletes members' messages that mention or reply to a game bot (e.g. `@Pokétwo c pikachu`). Off by default.
+- `EXEMPT_CHANNEL_IDS` adds staff-review channels excluded from automatic screening (including their threads); the mod-log channel is always excluded. Admin rechecks remain available.\n- `OPENAI_RPM` defaults to 200; verify your account's live rate limits.\n- `CLEANUP_INCLUDE_COMMANDS=true` also deletes members' messages that mention or reply to a game bot (e.g. `@Pokétwo c pikachu`). Off by default.
 - `rules.yaml` values are illustrative until calibrated. Editing it changes `rules_version`, recorded on every case.
 - `DRY_RUN` and each rule's `default_enforce` only **seed** the database on first start; afterwards the `/modbot` commands are authoritative.
 
