@@ -119,6 +119,7 @@ class Database:
         self._settings: dict[str, str] = {}
         self._cooldown_lock = asyncio.Lock()
         self._settings_lock = asyncio.Lock()
+        self._cases_lock = asyncio.Lock()
 
     @property
     def conn(self) -> aiosqlite.Connection:
@@ -285,32 +286,58 @@ class Database:
     ) -> int:
         """Insert a case. For reports, report_count is computed inside the INSERT,
         so concurrent reports get distinct counts. `notify` defaults to verdict.post."""
-        wants_post = verdict.post if notify is None else notify
-        cur = await self.conn.execute(
-            "INSERT INTO cases(message_id, channel_id, author_id, content_hash, content, source, model_version, "
-            "rules_version, trigger, report_count, scores_json, decision, rule_id, reason, enforced, action, "
-            "notify, ping, created_at) VALUES (?,?,?,?,?,?,?,?,?, "
-            "CASE WHEN ? = 'report' THEN (SELECT COUNT(*) + 1 FROM cases "
-            "WHERE message_id = ? AND content_hash = ? AND trigger = 'report') ELSE 0 END, "
-            "?,?,?,?,?,?,?,?,?)",
-            (
-                inp.message_id, inp.channel_id, inp.author_id, inp.hash,
-                None if verdict.redact else inp.content,
-                result.source if result else None,
-                result.model_version if result else None,
-                rules_version, trigger,
-                trigger, inp.message_id, inp.hash,
-                json.dumps({"scores": result.scores, "flagged": result.flagged}) if result else None,
-                verdict.decision.value, verdict.rule_id, verdict.reason,
-                int(verdict.enforced and verdict.decision is Decision.DELETE),
-                action,
-                "pending" if wants_post else None,
-                int(verdict.ping),
-                now(),
-            ),
-        )
-        await self.conn.commit()
-        return cur.lastrowid
+        # Serialize insert + notification dedup: a repeated report remains a case,
+        # but does not create another mod-log message for the same effective outcome.
+        async with self._cases_lock:
+            wants_post = verdict.post if notify is None else notify
+            cur = await self.conn.execute(
+                "INSERT INTO cases(message_id, channel_id, author_id, content_hash, content, source, model_version, "
+                "rules_version, trigger, report_count, scores_json, decision, rule_id, reason, enforced, action, "
+                "notify, ping, created_at) VALUES (?,?,?,?,?,?,?,?,?, "
+                "CASE WHEN ? = 'report' THEN (SELECT COUNT(*) + 1 FROM cases "
+                "WHERE message_id = ? AND content_hash = ? AND trigger = 'report') ELSE 0 END, "
+                "?,?,?,?,?,?,?,?,?)",
+                (
+                    inp.message_id, inp.channel_id, inp.author_id, inp.hash,
+                    None if verdict.redact else inp.content,
+                    result.source if result else None,
+                    result.model_version if result else None,
+                    rules_version, trigger,
+                    trigger, inp.message_id, inp.hash,
+                    json.dumps({"scores": result.scores, "flagged": result.flagged}) if result else None,
+                    verdict.decision.value, verdict.rule_id, verdict.reason,
+                    int(verdict.enforced and verdict.decision is Decision.DELETE),
+                    action,
+                    "pending" if wants_post else None,
+                    int(verdict.ping),
+                    now(),
+                ),
+            )
+            if trigger == "report" and wants_post:
+                # Compare with the latest prior report on this message version.
+                # A different decision, rule, ruleset or enforcement outcome
+                # always gets a fresh moderator notification.
+                await self.conn.execute(
+                    """UPDATE cases SET notify = NULL WHERE case_id = ?
+                    AND EXISTS (
+                      SELECT 1 FROM cases prev
+                      WHERE prev.case_id = (
+                        SELECT MAX(case_id) FROM cases
+                        WHERE message_id = ? AND content_hash = ?
+                        AND trigger = 'report' AND case_id < ?
+                      )
+                      AND prev.rules_version = ?
+                      AND prev.decision = ? AND prev.rule_id IS ?
+                      AND prev.enforced = ?
+                      AND COALESCE(prev.action, '') = COALESCE(?, '')
+                    )""",
+                    (cur.lastrowid, inp.message_id, inp.hash, cur.lastrowid,
+                     rules_version, verdict.decision.value, verdict.rule_id,
+                     int(verdict.enforced and verdict.decision is Decision.DELETE), action),
+                )
+            await self.conn.commit()
+            return cur.lastrowid
+
 
     async def get_case(self, case_id: int) -> aiosqlite.Row | None:
         async with self.conn.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)) as cur:
